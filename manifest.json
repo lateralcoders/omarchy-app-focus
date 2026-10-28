@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.lateralcoders.app-focus",
+  "name": "App Focus",
+  "version": "1.0.0",
+  "author": "Zute Predictive",
+  "license": "MIT",
+  "description": "Type an app name to focus its window, including one on another workspace or a hidden scratchpad, or launch it if it is closed. Several windows open a second step with a live screenshot of each one.",
+  "kinds": ["overlay"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "Overlay.qml"
+  }
+}

@@ -1,0 +1,680 @@
+#!/usr/bin/env python3
+"""Focus a running app, or launch it.
+
+The App Focus overlay calls this with --json, --previews, --activate, and
+--focus. With no arguments it opens the Omarchy text menu. One window is
+focused immediately. Several windows open a preview carousel when this file
+is run on its own. A hidden scratchpad is opened before focus. Obsidian,
+VS Code, and Tmux launch when nothing matches.
+"""
+
+import base64
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
+STATE_PATH = RUNTIME / "hypr-focus.json"
+PREVIEW_DIR = RUNTIME / "hypr-focus" / "previews"
+CONFIG_PATH = Path.home() / ".config" / "omarchy-switcher" / "launches.json"
+LAUNCH_GRACE_SECONDS = 3
+
+# search is extra menu text so "vscode" and "vsc" find "VS Code".
+# Launch commands are the stock Omarchy ones. ~/.config/omarchy-switcher/launches.json
+# replaces any of them with a local argv list.
+KNOWN = (
+    {
+        "id": "obsidian",
+        "label": "Obsidian",
+        "search": "",
+    },
+    {
+        "id": "vscode",
+        "label": "VS Code",
+        "search": "vscode",
+    },
+    {
+        "id": "tmux",
+        "label": "Tmux",
+        "search": "",
+    },
+)
+
+DEFAULT_LAUNCH = {
+    "obsidian": ["uwsm-app", "--", "obsidian"],
+    "vscode": ["uwsm-app", "--", "code"],
+    "tmux": ["omarchy-launch-terminal-tmux"],
+}
+
+ALIASES = {
+    "obsidian": "obsidian",
+    "code": "vscode",
+    "vscode": "vscode",
+    "vsc": "vscode",
+    "vs code": "vscode",
+    "tmux": "tmux",
+}
+
+
+def hyprctl_json(command):
+    raw = subprocess.check_output(["hyprctl", command, "-j"], text=True)
+    data = json.loads(raw)
+    return data if isinstance(data, list) else []
+
+
+def dispatch(expression):
+    result = subprocess.run(
+        ["hyprctl", "dispatch", expression],
+        capture_output=True,
+        text=True,
+    )
+    output = (result.stdout or "") + (result.stderr or "")
+    if result.returncode != 0 or output.strip() != "ok":
+        raise RuntimeError(output.strip() or f"dispatch failed: {expression}")
+
+
+def notify(message):
+    subprocess.run(
+        ["notify-send", "-a", "Focus", "-u", "low", message],
+        check=False,
+    )
+
+
+def cmdline(pid):
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return ""
+    return raw.replace(b"\0", b" ").decode(errors="replace")
+
+
+def token_is_tmux(token):
+    if not token or token.startswith("-"):
+        return False
+    base = os.path.basename(token)
+    return base == "tmux" or base.startswith("tmux:")
+
+
+def cmdline_is_tmux(command):
+    return any(token_is_tmux(token) for token in command.split())
+
+
+def process_tree():
+    """pid -> (ppid, cmdline, child pids) for the live process table."""
+    found = {}
+    proc = Path("/proc")
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        ppid = 0
+        try:
+            for line in (entry / "status").read_text(errors="replace").splitlines():
+                if line.startswith("PPid:"):
+                    ppid = int(line.split()[1])
+                    break
+            command = cmdline(pid)
+        except (OSError, ValueError):
+            continue
+        found[pid] = [ppid, command, []]
+    for pid, (parent, _command, _children) in found.items():
+        parent_row = found.get(parent)
+        if parent_row is not None:
+            parent_row[2].append(pid)
+    return found
+
+
+def pid_runs_tmux(pid, processes):
+    # foot's command line often already contains tmux. If it does not, the
+    # client is a child of the shell that foot started.
+    stack = [pid]
+    seen = set()
+    while stack:
+        current = stack.pop()
+        if not current or current in seen:
+            continue
+        seen.add(current)
+        row = processes.get(current)
+        if row is None:
+            continue
+        _parent, command, children = row
+        if cmdline_is_tmux(command):
+            return True
+        stack.extend(children)
+    return False
+
+
+def window_text(window):
+    return " ".join(
+        str(window.get(key) or "")
+        for key in ("class", "initialClass")
+    ).lower()
+
+
+def detail_for(group):
+    status = status_text(group["windows"])
+    search = (group.get("search") or "").lower()
+    if search and search not in group["label"].lower():
+        return f"{search} · {status}"
+    return status
+
+
+def matches_known(app_id, window, processes):
+    text = window_text(window)
+    if app_id == "obsidian":
+        return "obsidian" in text
+    if app_id == "vscode":
+        return "vscode" in text or "code-oss" in text
+    if app_id == "tmux":
+        return pid_runs_tmux(window.get("pid") or 0, processes)
+    return False
+
+
+def workspace_name(window):
+    workspace = window.get("workspace") or {}
+    return str(workspace.get("name") or "")
+
+
+def status_text(windows):
+    if not windows:
+        return "not open"
+    if len(windows) == 1:
+        name = workspace_name(windows[0])
+        if name.startswith("special:"):
+            return name.split(":", 1)[1] or "scratchpad"
+        return f"workspace {name}"
+    return f"{len(windows)} windows"
+
+
+def friendly_class(class_name):
+    if class_name == "foot":
+        return "Terminal"
+    leaf = class_name.rsplit(".", 1)[-1] or class_name
+    if leaf.islower():
+        return leaf[:1].upper() + leaf[1:]
+    return leaf
+
+
+def sort_windows(windows):
+    def key(window):
+        workspace = window.get("workspace") or {}
+        workspace_id = workspace.get("id") or 0
+        special = 1 if workspace_id < 0 else 0
+        at = window.get("at") or [0, 0]
+        x = at[0] if len(at) > 0 else 0
+        y = at[1] if len(at) > 1 else 0
+        return (special, workspace_id if workspace_id > 0 else abs(workspace_id), y, x, window.get("address") or "")
+
+    return sorted(windows, key=key)
+
+
+def launch_commands():
+    commands = {key: list(value) for key, value in DEFAULT_LAUNCH.items()}
+    try:
+        data = json.loads(CONFIG_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return commands
+    if not isinstance(data, dict):
+        return commands
+    for key, value in data.items():
+        if isinstance(value, list) and value and all(isinstance(part, str) and part for part in value):
+            commands[str(key)] = value
+    return commands
+
+
+def load_state():
+    try:
+        return json.loads(STATE_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(app_id, launched=False):
+    payload = {"id": app_id}
+    if launched:
+        payload["launched_at"] = time.time()
+    try:
+        STATE_PATH.write_text(json.dumps(payload))
+    except OSError:
+        pass
+
+
+def build_groups(windows):
+    processes = process_tree()
+    commands = launch_commands()
+    claimed = set()
+    groups = []
+
+    for app in KNOWN:
+        matched = []
+        for window in windows:
+            address = window.get("address")
+            if not address or address in claimed:
+                continue
+            if matches_known(app["id"], window, processes):
+                matched.append(window)
+                claimed.add(address)
+        groups.append({**app, "launch": commands.get(app["id"]), "windows": sort_windows(matched)})
+
+    by_class = {}
+    for window in windows:
+        address = window.get("address")
+        class_name = window.get("class") or ""
+        if not address or address in claimed or not class_name:
+            continue
+        by_class.setdefault(class_name, []).append(window)
+
+    for class_name in sorted(by_class, key=str.lower):
+        groups.append(
+            {
+                "id": f"class:{class_name}",
+                "label": friendly_class(class_name),
+                "search": class_name,
+                "launch": None,
+                "windows": sort_windows(by_class[class_name]),
+            }
+        )
+    return groups
+
+
+def ordered_groups(groups):
+    last = load_state().get("id")
+    if not last:
+        return groups
+    picked = [group for group in groups if group["id"] == last]
+    rest = [group for group in groups if group["id"] != last]
+    return picked + rest
+
+
+def special_visible(name, monitors):
+    for monitor in monitors:
+        special = (monitor.get("specialWorkspace") or {}).get("name") or ""
+        if special == name:
+            return True
+    return False
+
+
+def reveal_and_focus(window):
+    workspace = workspace_name(window)
+    if workspace.startswith("special:") and not special_visible(workspace, hyprctl_json("monitors")):
+        scratchpad = workspace.split(":", 1)[1]
+        dispatch(f'hl.dsp.workspace.toggle_special("{scratchpad}")')
+        deadline = time.monotonic() + 0.4
+        while time.monotonic() < deadline:
+            if special_visible(workspace, hyprctl_json("monitors")):
+                break
+            time.sleep(0.02)
+    dispatch(f'hl.dsp.focus({{ window = "address:{window["address"]}" }})')
+
+
+def launch(group):
+    command = group.get("launch")
+    if not command:
+        notify(f"{group['label']} is not open")
+        return
+    state = load_state()
+    launched_at = state.get("launched_at") or 0
+    if state.get("id") == group["id"] and time.time() - launched_at < LAUNCH_GRACE_SECONDS:
+        notify(f"{group['label']} is launching")
+        return
+    save_state(group["id"], launched=True)
+    result = subprocess.run(command, check=False)
+    if result.returncode != 0:
+        notify(f"Could not launch {group['label']}")
+
+
+def focus_window(group, window):
+    save_state(group["id"])
+    reveal_and_focus(window)
+
+
+def preview_label(window, used):
+    workspace = workspace_name(window)
+    if workspace.startswith("special:"):
+        place = workspace.split(":", 1)[1] or "scratchpad"
+    elif workspace:
+        place = f"workspace {workspace}"
+    else:
+        place = "window"
+    title = str(window.get("title") or window.get("class") or "window")
+    title = re.sub(r"[\x00-\x1f/\\:*?\"<>|]", " ", title)
+    # The preview label turns "-" and "_" into spaces, so keep hyphens as en dashes.
+    title = title.replace("-", "–").replace("_", " ")
+    title = re.sub(r"\s+", " ", title).strip()
+    title = title[:80] or "window"
+    base = f"{place} · {title}"
+    name = base
+    suffix = 2
+    while name.casefold() in used:
+        name = f"{base} {suffix}"
+        suffix += 1
+    used.add(name.casefold())
+    return name
+
+
+def capture_window(window, dest):
+    stable_id = str(window.get("stableId") or "")
+    if not stable_id:
+        return False
+    result = subprocess.run(
+        ["grim", "-t", "jpeg", "-q", "80", "-s", "1", "-T", stable_id, str(dest)],
+        capture_output=True,
+    )
+    return result.returncode == 0 and dest.is_file() and dest.stat().st_size > 0
+
+
+def placeholder_preview(dest, label):
+    result = subprocess.run(
+        [
+            "magick",
+            "-background",
+            "#1c1c1c",
+            "-fill",
+            "#f2f2f2",
+            "-gravity",
+            "center",
+            "-size",
+            "960x540",
+            f"caption:{label.replace('@', '')}",
+            str(dest),
+        ],
+        capture_output=True,
+    )
+    return result.returncode == 0 and dest.is_file() and dest.stat().st_size > 0
+
+
+def write_previews(windows):
+    if PREVIEW_DIR.exists():
+        shutil.rmtree(PREVIEW_DIR)
+    PREVIEW_DIR.mkdir(parents=True)
+    used = set()
+    jobs = []
+    for window in windows:
+        label = preview_label(window, used)
+        dest = PREVIEW_DIR / f"{label}.jpg"
+        jobs.append((window, dest, label))
+
+    def shoot(job):
+        window, dest, label = job
+        if capture_window(window, dest):
+            return window, dest
+        if placeholder_preview(dest, label):
+            return window, dest
+        return window, None
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        shot = list(pool.map(shoot, jobs))
+    return [(window, dest) for window, dest in shot if dest is not None]
+
+
+def pick_preview(windows):
+    """Show captured windows. Return the chosen window, or None if cancelled."""
+    captured = write_previews(windows)
+    if not captured:
+        return pick_window_text(windows)
+
+    by_path = {str(dest): window for window, dest in captured}
+    recent = min(windows, key=lambda window: window.get("focusHistoryID", 10**9))
+    selected = next((str(dest) for window, dest in captured if window is recent), "")
+    rows = "\n".join(f"{dest}\t{dest}" for _window, dest in captured)
+    encoded = base64.b64encode(rows.encode()).decode()
+
+    selection_file = tempfile.NamedTemporaryFile(prefix="hypr-focus-", delete=False)
+    selection_path = Path(selection_file.name)
+    selection_file.close()
+    done_file = tempfile.NamedTemporaryFile(prefix="hypr-focus-done-", delete=False)
+    done_path = Path(done_file.name)
+    done_file.close()
+    done_path.unlink(missing_ok=True)
+
+    try:
+        opened = subprocess.run(
+            [
+                "omarchy-shell",
+                "image-selector",
+                "open",
+                "",
+                encoded,
+                selected,
+                str(selection_path),
+                str(done_path),
+                "true",
+                "true",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if opened.returncode != 0 or opened.stdout.strip() != "ok":
+            return pick_window_text(windows)
+        deadline = time.monotonic() + 120
+        while not done_path.exists():
+            if time.monotonic() > deadline:
+                subprocess.run(
+                    ["omarchy-shell", "image-selector", "cancel", str(done_path)],
+                    check=False,
+                )
+                return None
+            time.sleep(0.05)
+        if not selection_path.is_file() or selection_path.stat().st_size == 0:
+            return None
+        chosen = selection_path.read_text().strip()
+        window = by_path.get(chosen)
+        if window is not None:
+            return window
+        chosen_name = Path(chosen).name
+        for path, item in by_path.items():
+            if Path(path).name == chosen_name:
+                return item
+        return None
+    finally:
+        selection_path.unlink(missing_ok=True)
+        done_path.unlink(missing_ok=True)
+
+
+def pick_window_text(windows):
+    options = []
+    by_label = {}
+    used = set()
+    for window in windows:
+        label = preview_label(window, used)
+        by_label[label] = window
+        workspace = workspace_name(window)
+        place = workspace.split(":", 1)[1] if workspace.startswith("special:") else f"workspace {workspace}"
+        options.append(f"\t{label}\t{place}")
+    result = subprocess.run(
+        ["omarchy-menu-select", "Choose window", *options, "--", "--width", "640", "--maxheight", "520"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    label = result.stdout.split("\t", 1)[0].strip()
+    return by_label.get(label)
+
+
+def activate(group):
+    windows = group["windows"]
+    if not windows:
+        launch(group)
+        return False
+    if len(windows) == 1:
+        focus_window(group, windows[0])
+        return True
+    window = pick_preview(windows)
+    if window is None:
+        return False
+    focus_window(group, window)
+    return True
+
+
+def resolve(query, groups):
+    wanted = ALIASES.get(query.strip().lower(), query.strip().lower())
+    exact = []
+    partial = []
+    for group in groups:
+        names = {group["id"].lower(), group["label"].lower()}
+        if group["id"].startswith("class:"):
+            names.add(group["id"].split(":", 1)[1].lower())
+        if wanted in names:
+            exact.append(group)
+        elif any(wanted in name for name in names):
+            partial.append(group)
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        return None
+    if len(partial) == 1:
+        return partial[0]
+    return None
+
+
+SEARCH_EXTRA = {
+    "obsidian": "obsidian",
+    "vscode": "code vscode vsc vs code",
+    "tmux": "tmux",
+}
+
+
+def public_groups(groups):
+    payload = []
+    for group in groups:
+        extra = SEARCH_EXTRA.get(group["id"], "")
+        payload.append(
+            {
+                "id": group["id"],
+                "label": group["label"],
+                "detail": detail_for(group),
+                "count": len(group["windows"]),
+                "search": " ".join(
+                    part
+                    for part in (group.get("search") or "", group["label"], group["id"], extra)
+                    if part
+                ),
+            }
+        )
+    return payload
+
+
+def focus_address(group, address):
+    for window in group["windows"]:
+        if window.get("address") == address:
+            focus_window(group, window)
+            return
+    notify("That window closed")
+    raise SystemExit(1)
+
+
+def preview_payload(group):
+    rows = []
+    for window, dest in write_previews(group["windows"]):
+        rows.append(
+            {
+                "address": window.get("address") or "",
+                "label": dest.stem,
+                "image": str(dest),
+            }
+        )
+    if not rows:
+        return rows
+    recent = min(group["windows"], key=lambda window: window.get("focusHistoryID", 10**9))
+    recent_address = recent.get("address")
+    rows.sort(key=lambda row: 0 if row["address"] == recent_address else 1)
+    return rows
+
+
+def pick_from_menu(groups):
+    options = [f"\t{group['label']}\t{detail_for(group)}" for group in groups]
+    result = subprocess.run(
+        [
+            "omarchy-menu-select",
+            "Focus app",
+            *options,
+            "--",
+            "--width",
+            "440",
+            "--maxheight",
+            "520",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    label = result.stdout.split("\t", 1)[0].strip()
+    if not label:
+        return None
+    for group in groups:
+        if group["label"] == label:
+            return group
+    return resolve(label, groups)
+
+
+def main():
+    windows = [window for window in hyprctl_json("clients") if window.get("address") and window.get("class")]
+    groups = build_groups(windows)
+    args = sys.argv[1:]
+    if args == ["--json"]:
+        print(json.dumps(public_groups(ordered_groups(groups))), flush=True)
+        return
+    if len(args) == 2 and args[0] == "--previews":
+        group = resolve(args[1], groups)
+        if group is None:
+            notify(f"No app matching {args[1]}")
+            sys.exit(1)
+        print(json.dumps(preview_payload(group)), flush=True)
+        return
+    if len(args) == 2 and args[0] == "--activate":
+        group = resolve(args[1], groups)
+        if group is None:
+            notify(f"No app matching {args[1]}")
+            sys.exit(1)
+        if len(group["windows"]) > 1:
+            focus_window(group, min(group["windows"], key=lambda window: window.get("focusHistoryID", 10**9)))
+            return
+        activate(group)
+        return
+    if len(args) == 3 and args[0] == "--focus":
+        group = resolve(args[1], groups)
+        if group is None:
+            notify(f"No app matching {args[1]}")
+            sys.exit(1)
+        focus_address(group, args[2])
+        return
+    query = " ".join(args).strip()
+    if query == "--list":
+        for group in ordered_groups(groups):
+            print(f"{group['id']}\t{group['label']}\t{detail_for(group)}\t{len(group['windows'])}")
+        return
+    if query:
+        group = resolve(query, groups)
+        if group is None:
+            notify(f"No app matching {query}")
+            sys.exit(1)
+        if not activate(group) and group["windows"]:
+            return
+        return
+
+    shown = ordered_groups(groups)
+    while True:
+        group = pick_from_menu(shown)
+        if group is None:
+            return
+        if activate(group):
+            return
+        if not group["windows"]:
+            return
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except RuntimeError as error:
+        notify(str(error))
+        sys.exit(1)
