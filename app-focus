@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Focus a running app, or launch it.
 
-The App Focus overlay calls this with --json, --previews, --activate, and
+The App Focus overlay calls this with --json, --prewarm, --previews, --activate, and
 --focus. With no arguments it opens the Omarchy text menu. One window is
 focused immediately. Several windows open a preview carousel when this file
 is run on its own. A hidden scratchpad is opened before focus. Obsidian,
@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -618,36 +619,8 @@ def monitor_for_window(window, monitors, spaces):
     return None
 
 
-def neighbor_pair(mon, monitors):
-    """The screens immediately left and right of mon, not the one above or below."""
-    left = []
-    right = []
-    for other in monitors:
-        if other["name"] == mon["name"]:
-            continue
-        top = max(mon["y"], other["y"])
-        bottom = min(mon["y"] + mon["height"], other["y"] + other["height"])
-        if bottom - top < min(mon["height"], other["height"]) * 0.5:
-            continue
-        if other["x"] + other["width"] <= mon["x"] + 8:
-            left.append(other)
-        elif other["x"] >= mon["x"] + mon["width"] - 8:
-            right.append(other)
-    left.sort(key=lambda other: mon["x"] - (other["x"] + other["width"]))
-    right.sort(key=lambda other: other["x"] - (mon["x"] + mon["width"]))
-    return (left[0] if left else None, right[0] if right else None)
-
-
-def showing_workspace_id(mon, spaces):
-    if mon["special"]:
-        for ws_id, info in spaces.items():
-            if info["name"] == mon["special"] and info["monitor"] == mon["name"]:
-                return ws_id
-    return mon["active_id"]
-
-
 def canvas_for(mon):
-    # Cap the long edge so a row of screens still fits a preview.
+    # Cap the long edge so one monitor fits the preview.
     fit = min(1.0, 1280 / mon["width"])
     return (
         max(1, int(round(mon["width"] * fit))),
@@ -758,7 +731,28 @@ def composite_windows(windows, shots, mon, fit, width, height, dest, place=None)
     return magick([*args, "-quality", "80", str(dest)])
 
 
+def blur_monitor(src, dest):
+    # Blur a small copy and scale it back. A full-size blur is the slow part.
+    return magick(
+        [
+            str(src),
+            "-filter",
+            "Box",
+            "-resize",
+            "40%",
+            "-blur",
+            "0x3",
+            "-resize",
+            "250%",
+            "-quality",
+            "80",
+            str(dest),
+        ]
+    )
+
+
 def highlight_window(base, target_path, box, width, height, dest):
+    """Paste the sharp window and its box onto an already blurred monitor."""
     x, y, w, h = box
     margin = 4
     x1 = min(max(x + margin, 2), width - 3)
@@ -768,8 +762,6 @@ def highlight_window(base, target_path, box, width, height, dest):
     return magick(
         [
             str(base),
-            "-blur",
-            "0x8",
             "(",
             str(target_path),
             "-resize",
@@ -801,37 +793,6 @@ def highlight_window(base, target_path, box, width, height, dest):
     )
 
 
-def dim_panel(src, dest):
-    return magick(
-        [
-            str(src),
-            "-blur",
-            "0x6",
-            "-fill",
-            "black",
-            "-colorize",
-            "38%",
-            "-quality",
-            "75",
-            str(dest),
-        ]
-    )
-
-
-def match_height(src, height, dest):
-    return magick([str(src), "-resize", f"x{height}", "-quality", "75", str(dest)])
-
-
-def append_panels(left, center, right, dest):
-    parts = [str(path) for path in (left, center, right) if path]
-    if not parts:
-        return False
-    if len(parts) == 1:
-        shutil.copy(parts[0], dest)
-        return dest.is_file()
-    return magick([*parts, "+append", "-quality", "82", str(dest)])
-
-
 def capture_shots(windows, raw_dir):
     jobs = []
     seen = set()
@@ -860,6 +821,10 @@ def capture_shots(windows, raw_dir):
 
 
 def write_previews(windows):
+    """Build one image per window, confined to that window's monitor.
+
+    The preview directory is replaced at the start, so only one capture may run.
+    """
     if PREVIEW_DIR.exists():
         shutil.rmtree(PREVIEW_DIR)
     PREVIEW_DIR.mkdir(parents=True)
@@ -887,73 +852,38 @@ def write_previews(windows):
         for peer in by_ws.get(ws_id, []):
             add(peer)
         add(window)
-        left = right = None
-        if mon:
-            left, right = neighbor_pair(mon, monitors)
-            for side in (left, right):
-                if side:
-                    for peer in by_ws.get(showing_workspace_id(side, spaces), []):
-                        add(peer)
-        targets.append((window, mon, left, right))
+        targets.append((window, mon, ws_id))
 
     shots = capture_shots(needed, work)
-    side_panels = {}
-    for _window, _mon, left, right in targets:
-        for side in (left, right):
-            if not side or side["name"] in side_panels:
-                continue
-            peers = by_ws.get(showing_workspace_id(side, spaces), [])
-            width, height, fit = canvas_for(side)
-            raw = work / f"side-{side['name']}.jpg"
-            dimmed = work / f"side-{side['name']}-dim.jpg"
-            panel = None
-            place = workspace_place(peers, side)
-            if peers and composite_windows(peers, shots, side, fit, width, height, raw, place) and dim_panel(raw, dimmed):
-                panel = dimmed
-            side_panels[side["name"]] = panel
-
-    fitted_sides = {}
-    for _window, mon, left, right in targets:
-        if not mon:
+    plates = {}
+    for window, mon, ws_id in targets:
+        if not mon or ws_id in plates:
             continue
-        _width, height, _fit = canvas_for(mon)
-        for side in (left, right):
-            if not side:
-                continue
-            key = (side["name"], height)
-            if key in fitted_sides:
-                continue
-            panel = side_panels.get(side["name"])
-            dest = work / f"fit-{side['name']}-{height}.jpg"
-            fitted_sides[key] = dest if panel and match_height(panel, height, dest) else None
+        peers = by_ws.get(ws_id, [window])
+        width, height, fit = canvas_for(mon)
+        place = workspace_place(peers, mon)
+        safe = re.sub(r"[^A-Za-z0-9]+", "", str(ws_id))
+        flat = work / f"flat-{safe}.jpg"
+        blurred = work / f"blur-{safe}.jpg"
+        if composite_windows(peers, shots, mon, fit, width, height, flat, place) and blur_monitor(flat, blurred):
+            plates[ws_id] = (blurred, width, height, fit, place)
 
     used = set()
     jobs = []
-    for window, mon, left, right in targets:
+    for window, mon, ws_id in targets:
         label = preview_label(window, used)
         dest = PREVIEW_DIR / f"{label}.jpg"
-        jobs.append((window, mon, left, right, dest, label))
+        jobs.append((window, mon, ws_id, dest, label))
 
     def shoot(job):
-        window, mon, left, right, dest, label = job
+        window, mon, ws_id, dest, label = job
         shot = shots.get(window.get("address"))
-        if mon and shot:
-            width, height, fit = canvas_for(mon)
-            peers = by_ws.get((window.get("workspace") or {}).get("id"), [window])
-            place = workspace_place(peers, mon)
+        plate = plates.get(ws_id)
+        if mon and shot and plate:
+            blurred, width, height, fit, place = plate
             box = rect_for(window, mon, fit, place)
-            safe = re.sub(r"[^A-Za-z0-9]+", "", str(window.get("stableId") or "w"))
-            flat = work / f"flat-{safe}.jpg"
-            marked = work / f"mark-{safe}.jpg"
-            if (
-                box
-                and composite_windows(peers, shots, mon, fit, width, height, flat, place)
-                and highlight_window(flat, shot, box, width, height, marked)
-            ):
-                left_path = fitted_sides.get((left["name"], height)) if left else None
-                right_path = fitted_sides.get((right["name"], height)) if right else None
-                if append_panels(left_path, marked, right_path, dest):
-                    return window, dest
+            if box and highlight_window(blurred, shot, box, width, height, dest):
+                return window, dest
         if shot:
             shutil.copy(shot, dest)
             return window, dest
@@ -961,15 +891,40 @@ def write_previews(windows):
             return window, dest
         return window, None
 
-    with ThreadPoolExecutor(max_workers=3) as pool:
+    with ThreadPoolExecutor(max_workers=4) as pool:
         shot = list(pool.map(shoot, jobs))
     shutil.rmtree(work, ignore_errors=True)
     return [(window, dest) for window, dest in shot if dest is not None]
 
 
-def pick_preview(windows):
+def capture_multi(groups):
+    """Capture every app that has several windows. One pass, shared by the menu."""
+    multi = [group for group in groups if len(group.get("windows") or []) > 1]
+    if not multi:
+        return {}
+    windows = []
+    seen = set()
+    for group in multi:
+        for window in group["windows"]:
+            address = window.get("address")
+            if address and address not in seen:
+                seen.add(address)
+                windows.append(window)
+    by_address = {window.get("address"): pair for pair in write_previews(windows) for window, _dest in [pair]}
+    ready = {}
+    for group in multi:
+        pairs = []
+        for window in group["windows"]:
+            pair = by_address.get(window.get("address"))
+            if pair:
+                pairs.append(pair)
+        ready[group["id"]] = pairs
+    return ready
+
+
+def pick_preview(windows, pairs=None):
     """Show captured windows. Return the chosen window, or None if cancelled."""
-    captured = write_previews(windows)
+    captured = list(pairs) if pairs is not None else write_previews(windows)
     if not captured:
         return pick_window_text(windows)
 
@@ -1125,9 +1080,9 @@ def focus_address(group, address):
     raise SystemExit(1)
 
 
-def preview_payload(group):
+def preview_rows(pairs, windows):
     rows = []
-    for window, dest in write_previews(group["windows"]):
+    for window, dest in pairs:
         rows.append(
             {
                 "address": window.get("address") or "",
@@ -1137,10 +1092,15 @@ def preview_payload(group):
         )
     if not rows:
         return rows
-    recent = min(group["windows"], key=lambda window: window.get("focusHistoryID", 10**9))
+    recent = min(windows, key=lambda window: window.get("focusHistoryID", 10**9))
     recent_address = recent.get("address")
     rows.sort(key=lambda row: 0 if row["address"] == recent_address else 1)
     return rows
+
+
+def preview_payload(group, pairs=None):
+    captured = list(pairs) if pairs is not None else write_previews(group["windows"])
+    return preview_rows(captured, group["windows"])
 
 
 def pick_from_menu(groups):
@@ -1176,6 +1136,17 @@ def main():
     args = sys.argv[1:]
     if args == ["--json"]:
         print(json.dumps(public_groups(ordered_groups(groups))), flush=True)
+        return
+    if args == ["--prewarm"]:
+        shown = ordered_groups(groups)
+        ready = capture_multi(shown)
+        by_id = {group["id"]: group for group in shown}
+        payload = {
+            group_id: preview_rows(pairs, by_id[group_id]["windows"])
+            for group_id, pairs in ready.items()
+            if group_id in by_id
+        }
+        print(json.dumps(payload), flush=True)
         return
     if len(args) == 2 and args[0] == "--previews":
         group = resolve(args[1], groups)
@@ -1216,13 +1187,35 @@ def main():
         return
 
     shown = ordered_groups(groups)
+    ready = {}
+
+    def warm():
+        try:
+            ready.update(capture_multi(shown))
+        except Exception:
+            return
+
+    # The menu blocks. Capture while it is open so a second step can reuse the files.
+    worker = threading.Thread(target=warm, daemon=True)
+    worker.start()
     while True:
         group = pick_from_menu(shown)
         if group is None:
             return
+        windows = group["windows"]
+        if len(windows) > 1:
+            worker.join(90)
+            if worker.is_alive():
+                window = pick_window_text(windows)
+            else:
+                window = pick_preview(windows, ready.get(group["id"]))
+            if window is None:
+                return
+            focus_window(group, window)
+            return
         if activate(group):
             return
-        if not group["windows"]:
+        if not windows:
             return
 
 

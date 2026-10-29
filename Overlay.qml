@@ -27,6 +27,10 @@ Item {
 
   property string previewQueuedId: ""
   property bool previewStopping: false
+  property var previewCache: ({})
+  property string warmWantedId: ""
+  property bool warmStopping: false
+  property bool warmRestart: false
 
   property color background: Commons.Color.menu.background
   property color foreground: Commons.Color.menu.text
@@ -88,7 +92,14 @@ Item {
     root.activeLabel = ""
     root.activeIcon = ""
     root.status = "Looking up apps…"
+    root.previewCache = ({})
+    root.warmWantedId = ""
+    root.warmRestart = false
     windowModel.clear()
+    if (warmProc.running) {
+      root.warmStopping = true
+      warmProc.running = false
+    }
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
     root.refreshApps()
   }
@@ -142,6 +153,42 @@ Item {
     root.apps = parsed
     root.status = ""
     root.rebuildApps()
+    Qt.callLater(function() { root.beginWarm() })
+  }
+
+  function beginWarm() {
+    if (!root.opened || root.mode !== "apps" || previewProc.running) return
+    if (warmProc.running) {
+      root.warmRestart = true
+      root.warmStopping = true
+      warmProc.running = false
+      return
+    }
+    root.launchWarm()
+  }
+
+  function launchWarm() {
+    root.warmStopping = false
+    root.warmRestart = false
+    warmProc.command = ["/usr/bin/python3", "-I", root.helperPath(), "--prewarm"]
+    warmProc.running = true
+  }
+
+  function applyWarm(raw) {
+    var parsed
+    try {
+      parsed = JSON.parse(raw)
+    } catch (e) {
+      parsed = null
+    }
+    if (!parsed || Array.isArray(parsed)) parsed = ({})
+    root.previewCache = parsed
+    var wanted = root.warmWantedId
+    if (!(wanted && root.mode === "windows" && root.activeId === wanted)) return
+    root.warmWantedId = ""
+    var rows = parsed[wanted]
+    if (rows && rows.length > 0) root.applyPreviews(rows)
+    else root.startPreviews(wanted)
   }
 
   function rebuildApps() {
@@ -209,14 +256,24 @@ Item {
     root.activeIcon = icon || ""
     root.mode = "windows"
     root.selectedIndex = 0
+    var cached = root.previewCache ? root.previewCache[appId] : null
+    if (cached && cached.length > 0) {
+      root.applyPreviews(cached)
+      return
+    }
     root.status = "Capturing previews…"
     windowModel.clear()
+    if (warmProc.running || root.warmStopping) {
+      root.warmWantedId = appId
+      return
+    }
     root.startPreviews(appId)
   }
 
   function backToApps() {
     root.mode = "apps"
     root.selectedIndex = root.appIndex
+    root.warmWantedId = ""
     root.status = ""
     Qt.callLater(function() {
       if (appModel.count > 0)
@@ -236,19 +293,22 @@ Item {
 
   function launchPreviews() {
     root.previewStopping = false
+    root.previewCache = ({})
     previewProc.command = ["/usr/bin/python3", "-I", root.helperPath(), "--previews", root.previewQueuedId]
     previewProc.running = true
   }
 
   function applyPreviews(raw) {
-    var parsed
-    try {
-      parsed = JSON.parse(raw)
-    } catch (e) {
-      root.status = "Could not capture previews"
-      return
+    var parsed = raw
+    if (typeof raw === "string") {
+      try {
+        parsed = JSON.parse(raw)
+      } catch (e) {
+        root.status = "Could not capture previews"
+        return
+      }
     }
-    if (!Array.isArray(parsed) || parsed.length === 0) {
+    if (typeof parsed === "string" || !parsed || !parsed.length) {
       root.status = "Could not capture previews"
       return
     }
@@ -354,6 +414,39 @@ Item {
         return
       }
       root.applyPreviews(previewOut.text)
+    }
+  }
+
+  Process {
+    id: warmProc
+    stdout: StdioCollector {
+      id: warmOut
+      waitForEnd: true
+    }
+    stderr: StdioCollector {
+      id: warmErr
+      waitForEnd: true
+    }
+    onExited: function(exitCode) {
+      if (root.warmStopping) {
+        root.warmStopping = false
+        var restart = root.warmRestart
+        root.warmRestart = false
+        if (restart && root.opened && root.mode === "apps" && !previewProc.running)
+          root.launchWarm()
+        return
+      }
+      if (!root.opened) return
+      if (exitCode !== 0) {
+        console.warn("app-focus prewarm failed", exitCode, warmErr.text)
+        var wanted = root.warmWantedId
+        if (wanted && root.mode === "windows" && root.activeId === wanted) {
+          root.warmWantedId = ""
+          root.startPreviews(wanted)
+        }
+        return
+      }
+      root.applyWarm(warmOut.text)
     }
   }
 
