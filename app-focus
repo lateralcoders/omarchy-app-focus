@@ -246,6 +246,192 @@ def save_state(app_id, launched=False):
         pass
 
 
+def data_dirs():
+    home = Path.home()
+    raw_home = os.environ.get("XDG_DATA_HOME", "")
+    roots = [Path(raw_home) if raw_home else home / ".local" / "share"]
+    raw_dirs = os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share")
+    for item in raw_dirs.split(":"):
+        if item:
+            roots.append(Path(item))
+    found = []
+    seen = set()
+    for root in roots:
+        key = str(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(root)
+    return found
+
+
+def read_desktop(path):
+    entry = {"id": path.stem, "name": "", "icon": "", "wm_class": "", "nodisplay": False, "handler": False}
+    in_entry = False
+    for line in path.read_text(errors="replace").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            if in_entry:
+                break
+            in_entry = stripped == "[Desktop Entry]"
+            continue
+        if not in_entry or "=" not in line or line.startswith("#"):
+            continue
+        key, value = line.split("=", 1)
+        if key == "Name" and not entry["name"]:
+            entry["name"] = value.strip()
+        elif key == "Icon" and not entry["icon"]:
+            entry["icon"] = value.strip()
+        elif key == "StartupWMClass" and not entry["wm_class"]:
+            entry["wm_class"] = value.strip()
+        elif key == "NoDisplay" and value.strip().lower() == "true":
+            entry["nodisplay"] = True
+    ident = entry["id"].lower()
+    name = entry["name"].lower()
+    entry["handler"] = "urlhandler" in ident or "url handler" in name
+    return entry
+
+
+def desktop_entries():
+    found = {}
+    for root in data_dirs():
+        folder = root / "applications"
+        if not folder.is_dir():
+            continue
+        for path in folder.glob("*.desktop"):
+            if path.name in found:
+                continue
+            try:
+                found[path.name] = read_desktop(path)
+            except OSError:
+                continue
+    return list(found.values())
+
+
+def icon_score(path):
+    text = str(path)
+    svg = 2 if path.suffix == ".svg" else 0
+    hicolor = 1 if "/hicolor/" in text else 0
+    size = 0
+    match = re.search(r"/(\d+)x\d+/", text)
+    if match:
+        size = int(match.group(1))
+    elif "/scalable/" in text:
+        size = 1024
+    return (svg, hicolor, size)
+
+
+def resolve_icon(name, cache):
+    if not name:
+        return ""
+    if name in cache:
+        return cache[name]
+    direct = Path(name)
+    if direct.is_absolute() and direct.is_file():
+        cache[name] = str(direct)
+        return cache[name]
+    stem = Path(name).name
+    for suffix in (".png", ".svg", ".xpm"):
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    best = ""
+    best_score = None
+    search_roots = [root / "icons" for root in data_dirs()]
+    search_roots.append(Path.home() / ".icons")
+    search_roots.append(Path("/usr/share/pixmaps"))
+    seen = set()
+    for base in search_roots:
+        key = str(base)
+        if key in seen or not base.is_dir():
+            continue
+        seen.add(key)
+        if base.name == "pixmaps":
+            candidates = [base / f"{stem}.svg", base / f"{stem}.png"]
+        else:
+            candidates = list(base.glob(f"*/*/apps/{stem}.svg"))
+            candidates.extend(base.glob(f"*/*/apps/{stem}.png"))
+            candidates.extend(base.glob(f"*/apps/{stem}.svg"))
+            candidates.extend(base.glob(f"*/apps/{stem}.png"))
+        for candidate in candidates:
+            if not candidate.is_file():
+                continue
+            score = icon_score(candidate)
+            if best_score is None or score > best_score:
+                best_score = score
+                best = str(candidate)
+    cache[name] = best
+    return best
+
+
+def icon_names(group):
+    names = []
+    group_id = group["id"]
+    if group_id.startswith("class:"):
+        names.append(group_id.split(":", 1)[1])
+    else:
+        names.append(group_id)
+    if group_id == "tmux":
+        names.append("foot")
+    elif group_id == "obsidian":
+        names.append("md.obsidian.Obsidian")
+    elif group_id == "vscode":
+        names.append("com.microsoft.VSCode")
+        names.append("vscode")
+    return [name for name in names if name]
+
+
+def matching_entry(group, entries):
+    wanted = {name.casefold() for name in icon_names(group)}
+
+    def score_of(entry):
+        wm = entry["wm_class"].casefold()
+        ident = entry["id"].casefold()
+        icon = Path(entry["icon"]).name.casefold()
+        for suffix in (".png", ".svg", ".xpm"):
+            if icon.endswith(suffix):
+                icon = icon[: -len(suffix)]
+        score = 0
+        if wm and wm in wanted:
+            score = 100
+        elif ident in wanted:
+            score = 80
+        elif icon in wanted:
+            score = 60
+        else:
+            for name in wanted:
+                leaf = name.rsplit(".", 1)[-1]
+                if leaf and leaf in {ident, icon, wm}:
+                    score = 40
+                    break
+        if score and entry["handler"]:
+            score -= 30
+        if score and entry["nodisplay"]:
+            score -= 10
+        return score
+
+    best = None
+    best_score = 0
+    for entry in entries:
+        score = score_of(entry)
+        if score > best_score:
+            best = entry
+            best_score = score
+    return best
+
+
+def attach_icons(groups):
+    entries = desktop_entries()
+    cache = {}
+    for group in groups:
+        entry = matching_entry(group, entries)
+        icon_name = entry["icon"] if entry else ""
+        if not icon_name and group["id"] == "tmux":
+            icon_name = "foot"
+        group["icon"] = resolve_icon(icon_name, cache) if icon_name else ""
+    return groups
+
+
 def build_groups(windows):
     processes = process_tree()
     commands = launch_commands()
@@ -281,7 +467,7 @@ def build_groups(windows):
                 "windows": sort_windows(by_class[class_name]),
             }
         )
-    return groups
+    return attach_icons(groups)
 
 
 def ordered_groups(groups):
@@ -552,6 +738,7 @@ def public_groups(groups):
                 "label": group["label"],
                 "detail": detail_for(group),
                 "count": len(group["windows"]),
+                "icon": group.get("icon") or "",
                 "search": " ".join(
                     part
                     for part in (group.get("search") or "", group["label"], group["id"], extra)

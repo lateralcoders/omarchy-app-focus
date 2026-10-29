@@ -21,6 +21,7 @@ Item {
   property string status: ""
   property string activeId: ""
   property string activeLabel: ""
+  property string activeIcon: ""
   property var apps: []
   property int imageRev: 0
 
@@ -38,7 +39,8 @@ Item {
   property string fontFamily: Style.font.menuFamily
   property int contentSpacing: Style.spacing.md
   property int headerHeight: Math.max(Style.space(34), Style.font.title + Style.spacing.controlPaddingY * 2)
-  property int rowHeight: Math.max(Style.space(46), Style.font.body + Style.font.caption + Style.spacing.sm)
+  property int rowHeight: Math.max(Style.space(52), Style.font.body + Style.font.caption + Style.spacing.sm)
+  property int iconSize: Style.space(28)
   property int appCardWidth: Math.min(Style.space(480), panel.width - Style.gapsOut * 2)
   property int windowCardWidth: Math.min(Style.space(920), panel.width - Style.gapsOut * 2)
   property int windowCardHeight: Math.min(Style.space(680), panel.height - Style.gapsOut * 2)
@@ -64,9 +66,16 @@ Item {
     return url
   }
 
-  function imageUrl(path) {
+  function fileUrl(path) {
     if (!path) return ""
-    return "file://" + encodeURI(String(path)) + "#" + root.imageRev
+    var value = String(path)
+    if (value.indexOf("file:") === 0 || value.indexOf("image:") === 0) return value
+    return "file://" + encodeURI(value)
+  }
+
+  function imageUrl(path) {
+    var url = root.fileUrl(path)
+    return url ? url + "#" + root.imageRev : ""
   }
 
   function open(payload) {
@@ -77,6 +86,7 @@ Item {
     root.appIndex = 0
     root.activeId = ""
     root.activeLabel = ""
+    root.activeIcon = ""
     root.status = "Looking up apps…"
     windowModel.clear()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
@@ -146,7 +156,8 @@ Item {
         label: String(app.label || ""),
         detail: String(app.detail || ""),
         windowCount: Number(app.count || 0),
-        search: String(app.search || "")
+        search: String(app.search || ""),
+        icon: String(app.icon || "")
       })
     }
     if (appModel.count === 0) root.selectedIndex = 0
@@ -185,16 +196,17 @@ Item {
     var row = appModel.get(root.selectedIndex)
     if (!row) return
     if (Number(row.windowCount) > 1) {
-      root.openWindows(String(row.appId), String(row.label))
+      root.openWindows(String(row.appId), String(row.label), String(row.icon || ""))
       return
     }
     root.runActivate(String(row.appId))
   }
 
-  function openWindows(appId, label) {
+  function openWindows(appId, label, icon) {
     root.appIndex = root.selectedIndex
     root.activeId = appId
     root.activeLabel = label
+    root.activeIcon = icon || ""
     root.mode = "windows"
     root.selectedIndex = 0
     root.status = "Capturing previews…"
@@ -441,17 +453,35 @@ Item {
         anchors.leftMargin: card.contentLeftInset
         spacing: root.contentSpacing
 
-        Text {
+        RowLayout {
           Layout.fillWidth: true
           Layout.preferredHeight: root.headerHeight
-          verticalAlignment: Text.AlignVCenter
-          textFormat: Text.PlainText
-          text: root.mode === "windows" ? (root.activeLabel || "Windows") : (root.filterText || "Type an app name")
-          color: root.foreground
-          opacity: root.mode === "apps" && !root.filterText ? 0.58 : 1
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.heading
-          elide: Text.ElideRight
+          spacing: Style.space(8)
+
+          Image {
+            visible: root.mode === "windows" && root.activeIcon.length > 0
+            source: root.fileUrl(root.activeIcon)
+            Layout.preferredWidth: visible ? root.iconSize : 0
+            Layout.preferredHeight: root.iconSize
+            Layout.alignment: Qt.AlignVCenter
+            fillMode: Image.PreserveAspectFit
+            smooth: true
+            cache: true
+            sourceSize.width: 64
+            sourceSize.height: 64
+          }
+
+          Text {
+            Layout.fillWidth: true
+            verticalAlignment: Text.AlignVCenter
+            textFormat: Text.PlainText
+            text: root.mode === "windows" ? (root.activeLabel || "Windows") : (root.filterText || "Type an app name")
+            color: root.foreground
+            opacity: root.mode === "apps" && !root.filterText ? 0.58 : 1
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.heading
+            elide: Text.ElideRight
+          }
         }
 
         Text {
@@ -486,16 +516,50 @@ Item {
               required property string detail
               required property real windowCount
               required property string search
+              required property string icon
               width: appList.width
               height: root.rowHeight
               radius: Style.space(6)
               color: index === root.selectedIndex ? root.selectedBackground : "transparent"
 
-              Column {
+              Rectangle {
+                id: iconSlot
                 anchors.left: parent.left
+                anchors.leftMargin: Style.spacing.sm
+                anchors.verticalCenter: parent.verticalCenter
+                width: root.iconSize
+                height: root.iconSize
+                radius: Style.space(6)
+                color: "transparent"
+
+                Image {
+                  id: rowIcon
+                  anchors.fill: parent
+                  source: icon ? root.fileUrl(icon) : ""
+                  fillMode: Image.PreserveAspectFit
+                  smooth: true
+                  asynchronous: true
+                  cache: true
+                  sourceSize.width: 64
+                  sourceSize.height: 64
+                }
+
+                Text {
+                  anchors.centerIn: parent
+                  visible: rowIcon.status !== Image.Ready
+                  textFormat: Text.PlainText
+                  text: label.length > 0 ? label.charAt(0).toUpperCase() : ""
+                  color: index === root.selectedIndex ? root.selectedText : root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                }
+              }
+
+              Column {
+                anchors.left: iconSlot.right
                 anchors.right: parent.right
                 anchors.verticalCenter: parent.verticalCenter
-                anchors.leftMargin: Style.spacing.sm
+                anchors.leftMargin: Style.space(10)
                 anchors.rightMargin: Style.spacing.sm
 
                 Text {

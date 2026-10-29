@@ -55,7 +55,7 @@ omarchy-shell shell toggle io.github.lateralcoders.app-focus
 | Esc | Clear the filter, then close | Back to the app list |
 | Click outside | Close | Close |
 
-Enter on an empty filter repeats the last app. The list puts that app first.
+Enter on an empty filter repeats the last app. The list puts that app first. Each row shows the app's desktop icon. Tmux uses the terminal icon, because those windows are the terminal. A missing icon falls back to the app's initial.
 
 ## Launch commands
 
