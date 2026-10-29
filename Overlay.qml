@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Layouts
 import Quickshell
+import Quickshell.Hyprland
 import Quickshell.Io
 import Quickshell.Wayland
 import qs.Commons
@@ -31,6 +32,8 @@ Item {
   property string warmWantedId: ""
   property bool warmStopping: false
   property bool warmRestart: false
+  property var anchorScreen: null
+  property bool focusPrimed: false
 
   property color background: Commons.Color.menu.background
   property color foreground: Commons.Color.menu.text
@@ -82,7 +85,19 @@ Item {
     return url ? url + "#" + root.imageRev : ""
   }
 
+  function screenForFocusedMonitor() {
+    var monitor = Hyprland.focusedMonitor
+    var wanted = monitor ? String(monitor.name || "") : ""
+    var screens = Quickshell.screens || []
+    for (var i = 0; i < screens.length; i++) {
+      if (wanted && screens[i].name === wanted) return screens[i]
+    }
+    return screens.length > 0 ? screens[0] : null
+  }
+
   function open(payload) {
+    root.focusPrimed = false
+    root.anchorScreen = root.screenForFocusedMonitor()
     root.opened = true
     root.mode = "apps"
     root.filterText = ""
@@ -101,10 +116,13 @@ Item {
       warmProc.running = false
     }
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+    focusPrimeTimer.restart()
     root.refreshApps()
   }
 
   function close() {
+    focusPrimeTimer.stop()
+    root.focusPrimed = false
     root.opened = false
     root.mode = "apps"
     root.filterText = ""
@@ -466,14 +484,26 @@ Item {
     }
   }
 
+  Timer {
+    id: focusPrimeTimer
+    interval: 75
+    onTriggered: if (root.opened) root.focusPrimed = true
+  }
+
   PanelWindow {
     id: panel
+    screen: root.anchorScreen
     visible: root.opened
     anchors { top: true; bottom: true; left: true; right: true }
     color: "transparent"
     WlrLayershell.namespace: "omarchy-app-focus"
     WlrLayershell.layer: WlrLayer.Overlay
-    WlrLayershell.keyboardFocus: WlrKeyboardFocus.Exclusive
+    // Exclusive grabs pointer hit-testing on every monitor, so a click on
+    // another screen never reaches the dismiss layers. Take focus with
+    // Exclusive, then leave it OnDemand so those clicks land per monitor.
+    WlrLayershell.keyboardFocus: root.opened
+      ? (root.focusPrimed ? WlrKeyboardFocus.OnDemand : WlrKeyboardFocus.Exclusive)
+      : WlrKeyboardFocus.None
     exclusionMode: ExclusionMode.Ignore
 
     Rectangle {
@@ -483,6 +513,7 @@ Item {
 
     MouseArea {
       anchors.fill: parent
+      acceptedButtons: Qt.AllButtons
       onClicked: root.dismiss()
     }
 
@@ -797,6 +828,40 @@ Item {
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
           elide: Text.ElideRight
+        }
+      }
+    }
+  }
+
+  // The card's surface only covers the monitor it opened on. A click on
+  // another monitor never reaches that surface, so each other monitor gets a
+  // dim layer whose only job is to close the switcher.
+  Variants {
+    model: root.opened ? Quickshell.screens : []
+
+    delegate: Component {
+      PanelWindow {
+        required property var modelData
+
+        screen: modelData
+        visible: root.opened && panel.screen && modelData.name !== panel.screen.name
+        color: "transparent"
+        exclusionMode: ExclusionMode.Ignore
+        WlrLayershell.namespace: "omarchy-app-focus-dismiss"
+        WlrLayershell.layer: WlrLayer.Overlay
+        WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
+
+        anchors { top: true; bottom: true; left: true; right: true }
+
+        Rectangle {
+          anchors.fill: parent
+          color: root.scrim
+        }
+
+        MouseArea {
+          anchors.fill: parent
+          acceptedButtons: Qt.AllButtons
+          onPressed: root.dismiss()
         }
       }
     }

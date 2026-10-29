@@ -204,14 +204,12 @@ def friendly_class(class_name):
 
 
 def sort_windows(windows):
+    """Most recently focused first. Hyprland numbers the current window 0."""
+
     def key(window):
-        workspace = window.get("workspace") or {}
-        workspace_id = workspace.get("id") or 0
-        special = 1 if workspace_id < 0 else 0
-        at = window.get("at") or [0, 0]
-        x = at[0] if len(at) > 0 else 0
-        y = at[1] if len(at) > 1 else 0
-        return (special, workspace_id if workspace_id > 0 else abs(workspace_id), y, x, window.get("address") or "")
+        history = window.get("focusHistoryID")
+        age = history if isinstance(history, int) else 10**9
+        return (age, window.get("address") or "")
 
     return sorted(windows, key=key)
 

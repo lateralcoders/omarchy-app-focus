@@ -53,11 +53,11 @@ omarchy-shell shell toggle io.github.lateralcoders.app-focus
 | Click a row | Same as Enter | First click selects, second click focuses |
 | Click the large screenshot | | Focus it |
 | Esc | Clear the filter, then close | Back to the app list |
-| Click outside | Close | Close |
+| Click outside, including another monitor | Close | Close |
 
 Enter on an empty filter repeats the last app. The list puts that app first. Each row shows the app's desktop icon. Tmux uses the terminal icon, because those windows are the terminal. A missing icon falls back to the app's initial.
 
-A window screenshot is that window on its own monitor. Other apps on that monitor stay blurred, and a light box marks the one you would focus. In the thumbnail row, the selected window is the one with the border. Previews for apps with several windows start as soon as the list is on screen, so the second step is usually already loaded.
+A window screenshot is that window on its own monitor. Other apps on that monitor stay blurred, and a light box marks the one you would focus. In the thumbnail row, the selected window is the one with the border. The row is most recently focused first. Hyprland already records that order. Previews for apps with several windows start as soon as the list is on screen, so the second step is usually already loaded.
 
 ## Launch commands
 
