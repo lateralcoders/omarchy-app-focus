@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -21,13 +22,136 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
-STATE_PATH = RUNTIME / "hypr-focus.json"
-# Home cache, not /tmp. File names stay window ids so grim and magick
-# arguments never include a window title.
-PREVIEW_DIR = Path.home() / ".cache" / "omarchy" / "app-focus-previews"
+# grim and magick inherit this, so files they create are user-only from the start.
+os.umask(0o077)
+
+CACHE_DIR = Path.home() / ".cache" / "omarchy" / "app-focus"
+PREVIEW_DIR = CACHE_DIR / "previews"
+STATE_PATH = CACHE_DIR / "state.json"
 CONFIG_PATH = Path.home() / ".config" / "omarchy-switcher" / "launches.json"
 LAUNCH_GRACE_SECONDS = 3
+
+
+def legacy_state_paths():
+    paths = [Path("/tmp") / "hypr-focus.json"]
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime:
+        paths.append(Path(runtime) / "hypr-focus.json")
+    return paths
+
+
+def legacy_preview_dirs():
+    paths = [
+        Path.home() / ".cache" / "omarchy" / "app-focus-previews",
+        Path("/tmp") / "hypr-focus" / "previews",
+    ]
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime:
+        paths.append(Path(runtime) / "hypr-focus" / "previews")
+    return paths
+
+
+def private_mkdir(path):
+    """Create a 0700 directory owned by this user. Refuse a symlink or a shared parent."""
+    parent = path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    parent_info = parent.lstat()
+    if stat.S_ISLNK(parent_info.st_mode) or parent_info.st_uid != os.getuid():
+        raise OSError("cache parent is not owned by this user")
+    if stat.S_IMODE(parent_info.st_mode) & 0o022:
+        raise OSError("cache parent is writable by other accounts")
+    if path.is_symlink():
+        path.unlink()
+    path.mkdir(mode=0o700, exist_ok=True)
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            raise OSError("directory is not owned by this user")
+        os.fchmod(fd, 0o700)
+        info = os.fstat(fd)
+    finally:
+        os.close(fd)
+    if stat.S_IMODE(info.st_mode) & 0o077:
+        raise OSError("directory is not private")
+
+
+def remove_tree_owned(path):
+    """Remove a regular file, symlink, or directory this user owns. Do not follow links."""
+    try:
+        info = path.lstat()
+    except OSError:
+        return
+    if info.st_uid != os.getuid():
+        return
+    if stat.S_ISLNK(info.st_mode) or stat.S_ISREG(info.st_mode):
+        path.unlink()
+        return
+    if stat.S_ISDIR(info.st_mode):
+        shutil.rmtree(path)
+
+
+def seal_file(path):
+    """Force a regular file this user owns to 0600. A symlink is removed and rejected."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        remove_tree_owned(path)
+        return False
+    ok = False
+    try:
+        info = os.fstat(fd)
+        if stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid():
+            os.fchmod(fd, 0o600)
+            info = os.fstat(fd)
+            ok = stat.S_IMODE(info.st_mode) & 0o077 == 0 and info.st_uid == os.getuid()
+    finally:
+        os.close(fd)
+    if not ok:
+        remove_tree_owned(path)
+    return ok
+
+
+def read_owned(path):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            return None
+        return os.read(fd, 1_000_000).decode()
+    finally:
+        os.close(fd)
+
+
+def write_private(path, text):
+    private_mkdir(path.parent)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        os.write(fd, text.encode())
+        info = os.fstat(fd)
+    finally:
+        os.close(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
+        remove_tree_owned(path)
+        raise OSError("file is not private")
+
+
+def private_temp(prefix):
+    private_mkdir(CACHE_DIR)
+    fd, name = tempfile.mkstemp(prefix=prefix, suffix=".txt", dir=CACHE_DIR)
+    try:
+        os.fchmod(fd, 0o600)
+    finally:
+        os.close(fd)
+    path = Path(name)
+    if not seal_file(path):
+        raise OSError("temporary file is not private")
+    return path
 
 # search is extra menu text so "vscode" and "vsc" find "VS Code".
 # Launch commands are the stock Omarchy ones. ~/.config/omarchy-switcher/launches.json
@@ -230,11 +354,32 @@ def launch_commands():
     return commands
 
 
-def load_state():
+def read_json(path):
+    text = read_owned(path)
+    if not text:
+        return None
     try:
-        return json.loads(STATE_PATH.read_text())
-    except (OSError, json.JSONDecodeError):
-        return {}
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def load_state():
+    data = read_json(STATE_PATH)
+    if data is not None:
+        return data
+    for path in legacy_state_paths():
+        data = read_json(path)
+        if data is None:
+            continue
+        try:
+            write_private(STATE_PATH, json.dumps(data))
+            remove_tree_owned(path)
+        except OSError:
+            pass
+        return data
+    return {}
 
 
 def save_state(app_id, launched=False):
@@ -242,7 +387,7 @@ def save_state(app_id, launched=False):
     if launched:
         payload["launched_at"] = time.time()
     try:
-        STATE_PATH.write_text(json.dumps(payload))
+        write_private(STATE_PATH, json.dumps(payload))
     except OSError:
         pass
 
@@ -819,8 +964,9 @@ def capture_shots(windows, raw_dir):
 
     def shoot(job):
         window, dest = job
-        if capture_window(window, dest):
+        if capture_window(window, dest) and seal_file(dest):
             return window.get("address"), dest
+        remove_tree_owned(dest)
         return window.get("address"), None
 
     shots = {}
@@ -834,20 +980,12 @@ def capture_shots(windows, raw_dir):
 
 
 def reset_preview_dir():
-    """Replace the preview directory. It is mode 0700 under the home cache."""
-    PREVIEW_DIR.parent.mkdir(parents=True, exist_ok=True)
-    if PREVIEW_DIR.is_symlink():
-        PREVIEW_DIR.unlink()
-    elif PREVIEW_DIR.exists():
-        if PREVIEW_DIR.is_dir():
-            shutil.rmtree(PREVIEW_DIR)
-        else:
-            PREVIEW_DIR.unlink()
-    PREVIEW_DIR.mkdir(mode=0o700)
-    os.chmod(PREVIEW_DIR, 0o700)
-    legacy = RUNTIME / "hypr-focus" / "previews"
-    if legacy != PREVIEW_DIR and legacy.is_dir() and not legacy.is_symlink():
-        shutil.rmtree(legacy, ignore_errors=True)
+    """Replace the preview directory. Cache directories are mode 0700."""
+    private_mkdir(CACHE_DIR)
+    remove_tree_owned(PREVIEW_DIR)
+    private_mkdir(PREVIEW_DIR)
+    for path in legacy_preview_dirs():
+        remove_tree_owned(path)
 
 
 def write_previews(windows):
@@ -858,7 +996,7 @@ def write_previews(windows):
     """
     reset_preview_dir()
     work = PREVIEW_DIR / "work"
-    work.mkdir()
+    private_mkdir(work)
     monitors, spaces = layout()
     clients = [client for client in hyprctl_json("clients") if client.get("address") and client.get("class")]
     by_ws = {}
@@ -894,8 +1032,17 @@ def write_previews(windows):
         safe = re.sub(r"[^A-Za-z0-9]+", "", str(ws_id))
         flat = work / f"flat-{safe}.jpg"
         blurred = work / f"blur-{safe}.jpg"
-        if composite_windows(peers, shots, mon, fit, width, height, flat, place) and blur_monitor(flat, blurred):
+        made = (
+            composite_windows(peers, shots, mon, fit, width, height, flat, place)
+            and seal_file(flat)
+            and blur_monitor(flat, blurred)
+            and seal_file(blurred)
+        )
+        if made:
             plates[ws_id] = (blurred, width, height, fit, place)
+        else:
+            remove_tree_owned(flat)
+            remove_tree_owned(blurred)
 
     used_names = set()
     jobs = []
@@ -918,12 +1065,9 @@ def write_previews(windows):
             wrote = True
         if not wrote and placeholder_preview(dest):
             wrote = True
-        if not wrote or not dest.is_file():
+        if not wrote or not seal_file(dest):
+            remove_tree_owned(dest)
             return window, None
-        try:
-            os.chmod(dest, 0o600)
-        except OSError:
-            pass
         return window, dest
 
     with ThreadPoolExecutor(max_workers=4) as pool:
@@ -970,13 +1114,11 @@ def pick_preview(windows, pairs=None):
     rows = "\n".join(f"{dest}\t{dest}" for _window, dest in captured)
     encoded = base64.b64encode(rows.encode()).decode()
 
-    selection_file = tempfile.NamedTemporaryFile(prefix="hypr-focus-", delete=False)
-    selection_path = Path(selection_file.name)
-    selection_file.close()
-    done_file = tempfile.NamedTemporaryFile(prefix="hypr-focus-done-", delete=False)
-    done_path = Path(done_file.name)
-    done_file.close()
-    done_path.unlink(missing_ok=True)
+    try:
+        selection_path = private_temp("selection-")
+    except OSError:
+        return None
+    done_path = CACHE_DIR / f"done-{selection_path.name}"
 
     try:
         opened = subprocess.run(
@@ -998,7 +1140,13 @@ def pick_preview(windows, pairs=None):
         if opened.returncode != 0 or opened.stdout.strip() != "ok":
             return None
         deadline = time.monotonic() + 120
-        while not done_path.exists():
+        while True:
+            try:
+                done_info = done_path.lstat()
+            except OSError:
+                done_info = None
+            if done_info is not None and stat.S_ISREG(done_info.st_mode) and done_info.st_uid == os.getuid():
+                break
             if time.monotonic() > deadline:
                 subprocess.run(
                     ["omarchy-shell", "image-selector", "cancel", str(done_path)],
@@ -1006,9 +1154,11 @@ def pick_preview(windows, pairs=None):
                 )
                 return None
             time.sleep(0.05)
-        if not selection_path.is_file() or selection_path.stat().st_size == 0:
+        if not seal_file(done_path) or not seal_file(selection_path):
             return None
-        chosen = selection_path.read_text().strip()
+        chosen = (read_owned(selection_path) or "").strip()
+        if not chosen:
+            return None
         window = by_path.get(chosen)
         if window is not None:
             return window
@@ -1018,8 +1168,8 @@ def pick_preview(windows, pairs=None):
                 return item
         return None
     finally:
-        selection_path.unlink(missing_ok=True)
-        done_path.unlink(missing_ok=True)
+        remove_tree_owned(selection_path)
+        remove_tree_owned(done_path)
 
 
 def activate(group):
