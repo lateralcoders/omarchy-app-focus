@@ -42,8 +42,8 @@ Item {
   property int rowHeight: Math.max(Style.space(52), Style.font.body + Style.font.caption + Style.spacing.sm)
   property int iconSize: Style.space(28)
   property int appCardWidth: Math.min(Style.space(480), panel.width - Style.gapsOut * 2)
-  property int windowCardWidth: Math.min(Style.space(920), panel.width - Style.gapsOut * 2)
-  property int windowCardHeight: Math.min(Style.space(680), panel.height - Style.gapsOut * 2)
+  property int windowCardWidth: Math.min(Style.space(1480), panel.width - Style.gapsOut * 2)
+  property int windowCardHeight: Math.min(Style.space(860), panel.height - Style.gapsOut * 2)
 
   function fittedAppHeight() {
     var rows = Math.max(1, appModel.count)
@@ -666,12 +666,12 @@ Item {
               height: Style.space(72)
               radius: Style.space(4)
               color: "transparent"
-              border.width: index === root.selectedIndex ? Math.max(2, Style.space(2)) : Math.max(1, Style.space(1))
-              border.color: index === root.selectedIndex ? root.selectedBackground : root.border
+              border.width: index === root.selectedIndex ? Math.max(2, Style.space(2)) : 0
+              border.color: root.foreground
 
               Image {
                 anchors.fill: parent
-                anchors.margins: Style.space(3)
+                anchors.margins: index === root.selectedIndex ? Style.space(4) : Style.space(2)
                 source: root.imageUrl(image)
                 fillMode: Image.PreserveAspectFit
                 smooth: true

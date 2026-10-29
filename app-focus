@@ -576,27 +576,394 @@ def placeholder_preview(dest, label):
     return result.returncode == 0 and dest.is_file() and dest.stat().st_size > 0
 
 
+def layout():
+    monitors = []
+    for mon in hyprctl_json("monitors"):
+        active = mon.get("activeWorkspace") or {}
+        special = mon.get("specialWorkspace") or {}
+        monitors.append(
+            {
+                "name": str(mon.get("name") or ""),
+                "x": int(mon.get("x") or 0),
+                "y": int(mon.get("y") or 0),
+                "width": max(1, int(mon.get("width") or 1)),
+                "height": max(1, int(mon.get("height") or 1)),
+                "active_id": active.get("id"),
+                "special": str(special.get("name") or ""),
+            }
+        )
+    spaces = {}
+    for space in hyprctl_json("workspaces"):
+        spaces[space.get("id")] = {
+            "name": str(space.get("name") or ""),
+            "monitor": str(space.get("monitor") or ""),
+        }
+    return monitors, spaces
+
+
+def monitor_for_window(window, monitors, spaces):
+    info = spaces.get((window.get("workspace") or {}).get("id")) or {}
+    for mon in monitors:
+        if mon["name"] and mon["name"] == info.get("monitor"):
+            return mon
+    at = window.get("at") or [0, 0]
+    size = window.get("size") or [0, 0]
+    if len(at) < 2 or len(size) < 2:
+        return None
+    cx = at[0] + size[0] / 2
+    cy = at[1] + size[1] / 2
+    for mon in monitors:
+        if mon["x"] <= cx < mon["x"] + mon["width"] and mon["y"] <= cy < mon["y"] + mon["height"]:
+            return mon
+    return None
+
+
+def neighbor_pair(mon, monitors):
+    """The screens immediately left and right of mon, not the one above or below."""
+    left = []
+    right = []
+    for other in monitors:
+        if other["name"] == mon["name"]:
+            continue
+        top = max(mon["y"], other["y"])
+        bottom = min(mon["y"] + mon["height"], other["y"] + other["height"])
+        if bottom - top < min(mon["height"], other["height"]) * 0.5:
+            continue
+        if other["x"] + other["width"] <= mon["x"] + 8:
+            left.append(other)
+        elif other["x"] >= mon["x"] + mon["width"] - 8:
+            right.append(other)
+    left.sort(key=lambda other: mon["x"] - (other["x"] + other["width"]))
+    right.sort(key=lambda other: other["x"] - (mon["x"] + mon["width"]))
+    return (left[0] if left else None, right[0] if right else None)
+
+
+def showing_workspace_id(mon, spaces):
+    if mon["special"]:
+        for ws_id, info in spaces.items():
+            if info["name"] == mon["special"] and info["monitor"] == mon["name"]:
+                return ws_id
+    return mon["active_id"]
+
+
+def canvas_for(mon):
+    # Cap the long edge so a row of screens still fits a preview.
+    fit = min(1.0, 1280 / mon["width"])
+    return (
+        max(1, int(round(mon["width"] * fit))),
+        max(1, int(round(mon["height"] * fit))),
+        fit,
+    )
+
+
+def rect_for(window, mon, fit, place=None):
+    at = window.get("at") or [0, 0]
+    size = window.get("size") or [0, 0]
+    if len(at) < 2 or len(size) < 2:
+        return None
+    if place is None:
+        x = (at[0] - mon["x"]) * fit
+        y = (at[1] - mon["y"]) * fit
+        width = size[0] * fit
+        height = size[1] * fit
+    else:
+        scale, min_x, min_y, target_x, target_y = place
+        x = (target_x + (at[0] - min_x) * scale - mon["x"]) * fit
+        y = (target_y + (at[1] - min_y) * scale - mon["y"]) * fit
+        width = size[0] * scale * fit
+        height = size[1] * scale * fit
+    if width < 2 or height < 2:
+        return None
+    return (int(round(x)), int(round(y)), max(1, int(round(width))), max(1, int(round(height))))
+
+
+def workspace_place(windows, mon):
+    """Fit a workspace onto its screen when Hyprland parked it off the monitor.
+
+    Hidden workspaces sometimes report a row of windows wider than the screen,
+    or shifted off to one side. Windows that already sit on the monitor stay
+    where they are. Otherwise the group is scaled to fit, gaps included.
+    """
+    boxes = []
+    for window in windows:
+        at = window.get("at") or []
+        size = window.get("size") or []
+        if len(at) < 2 or len(size) < 2 or size[0] < 2 or size[1] < 2:
+            continue
+        boxes.append((at[0], at[1], size[0], size[1]))
+    if not boxes:
+        return None
+
+    def mostly_on(box):
+        x, y, w, h = box
+        overlap_w = max(0, min(x + w, mon["x"] + mon["width"]) - max(x, mon["x"]))
+        overlap_h = max(0, min(y + h, mon["y"] + mon["height"]) - max(y, mon["y"]))
+        return overlap_w * overlap_h >= 0.85 * w * h
+
+    if all(mostly_on(box) for box in boxes):
+        return None
+    min_x = min(box[0] for box in boxes)
+    min_y = min(box[1] for box in boxes)
+    span_w = max(1.0, max(box[0] + box[2] for box in boxes) - min_x)
+    span_h = max(1.0, max(box[1] + box[3] for box in boxes) - min_y)
+    margin = 16
+    avail_w = max(1, mon["width"] - margin * 2)
+    avail_h = max(1, mon["height"] - margin * 2)
+    scale = min(avail_w / span_w, avail_h / span_h, 1.0)
+    target_x = mon["x"] + (mon["width"] - span_w * scale) / 2
+    target_y = mon["y"] + (mon["height"] - span_h * scale) / 2
+    return (scale, min_x, min_y, target_x, target_y)
+
+
+def magick(args):
+    result = subprocess.run(["magick", *args], capture_output=True)
+    return result.returncode == 0
+
+
+def paint_order(windows):
+    def key(window):
+        history = window.get("focusHistoryID")
+        age = history if isinstance(history, int) else 0
+        return (1 if window.get("floating") else 0, -age)
+
+    return sorted(windows, key=key)
+
+
+def composite_windows(windows, shots, mon, fit, width, height, dest, place=None):
+    # Each window's own surface, placed where it sits. A live monitor shot
+    # would be whichever workspace is on screen now, with this switcher on top.
+    args = ["-size", f"{width}x{height}", "xc:#141418"]
+    placed = False
+    for window in paint_order(windows):
+        path = shots.get(window.get("address"))
+        box = rect_for(window, mon, fit, place)
+        if not path or not box:
+            continue
+        x, y, w, h = box
+        if x >= width or y >= height or x + w <= 0 or y + h <= 0:
+            continue
+        args += [
+            "(",
+            str(path),
+            "-resize",
+            f"{w}x{h}!",
+            ")",
+            "-geometry",
+            f"{x:+d}{y:+d}",
+            "-composite",
+        ]
+        placed = True
+    if not placed:
+        return False
+    return magick([*args, "-quality", "80", str(dest)])
+
+
+def highlight_window(base, target_path, box, width, height, dest):
+    x, y, w, h = box
+    margin = 4
+    x1 = min(max(x + margin, 2), width - 3)
+    y1 = min(max(y + margin, 2), height - 3)
+    x2 = max(min(x + w - margin, width - 3), x1 + 2)
+    y2 = max(min(y + h - margin, height - 3), y1 + 2)
+    return magick(
+        [
+            str(base),
+            "-blur",
+            "0x8",
+            "(",
+            str(target_path),
+            "-resize",
+            f"{w}x{h}!",
+            ")",
+            "-geometry",
+            f"{x:+d}{y:+d}",
+            "-composite",
+            "-stroke",
+            "#0b0b10",
+            "-strokewidth",
+            "12",
+            "-fill",
+            "none",
+            "-draw",
+            f"rectangle {x1},{y1} {x2},{y2}",
+            "-stroke",
+            "#f6f6f2",
+            "-strokewidth",
+            "4",
+            "-fill",
+            "none",
+            "-draw",
+            f"rectangle {x1},{y1} {x2},{y2}",
+            "-quality",
+            "82",
+            str(dest),
+        ]
+    )
+
+
+def dim_panel(src, dest):
+    return magick(
+        [
+            str(src),
+            "-blur",
+            "0x6",
+            "-fill",
+            "black",
+            "-colorize",
+            "38%",
+            "-quality",
+            "75",
+            str(dest),
+        ]
+    )
+
+
+def match_height(src, height, dest):
+    return magick([str(src), "-resize", f"x{height}", "-quality", "75", str(dest)])
+
+
+def append_panels(left, center, right, dest):
+    parts = [str(path) for path in (left, center, right) if path]
+    if not parts:
+        return False
+    if len(parts) == 1:
+        shutil.copy(parts[0], dest)
+        return dest.is_file()
+    return magick([*parts, "+append", "-quality", "82", str(dest)])
+
+
+def capture_shots(windows, raw_dir):
+    jobs = []
+    seen = set()
+    for window in windows:
+        address = window.get("address") or ""
+        stable_id = str(window.get("stableId") or "")
+        if not address or not stable_id or address in seen:
+            continue
+        seen.add(address)
+        jobs.append((window, raw_dir / f"{stable_id}.jpg"))
+
+    def shoot(job):
+        window, dest = job
+        if capture_window(window, dest):
+            return window.get("address"), dest
+        return window.get("address"), None
+
+    shots = {}
+    if not jobs:
+        return shots
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for address, dest in pool.map(shoot, jobs):
+            if dest is not None:
+                shots[address] = dest
+    return shots
+
+
 def write_previews(windows):
     if PREVIEW_DIR.exists():
         shutil.rmtree(PREVIEW_DIR)
     PREVIEW_DIR.mkdir(parents=True)
+    work = PREVIEW_DIR / "work"
+    work.mkdir()
+    monitors, spaces = layout()
+    clients = [client for client in hyprctl_json("clients") if client.get("address") and client.get("class")]
+    by_ws = {}
+    for client in clients:
+        by_ws.setdefault((client.get("workspace") or {}).get("id"), []).append(client)
+
+    needed = []
+    seen = set()
+
+    def add(window):
+        address = window.get("address")
+        if address and address not in seen:
+            seen.add(address)
+            needed.append(window)
+
+    targets = []
+    for window in windows:
+        mon = monitor_for_window(window, monitors, spaces)
+        ws_id = (window.get("workspace") or {}).get("id")
+        for peer in by_ws.get(ws_id, []):
+            add(peer)
+        add(window)
+        left = right = None
+        if mon:
+            left, right = neighbor_pair(mon, monitors)
+            for side in (left, right):
+                if side:
+                    for peer in by_ws.get(showing_workspace_id(side, spaces), []):
+                        add(peer)
+        targets.append((window, mon, left, right))
+
+    shots = capture_shots(needed, work)
+    side_panels = {}
+    for _window, _mon, left, right in targets:
+        for side in (left, right):
+            if not side or side["name"] in side_panels:
+                continue
+            peers = by_ws.get(showing_workspace_id(side, spaces), [])
+            width, height, fit = canvas_for(side)
+            raw = work / f"side-{side['name']}.jpg"
+            dimmed = work / f"side-{side['name']}-dim.jpg"
+            panel = None
+            place = workspace_place(peers, side)
+            if peers and composite_windows(peers, shots, side, fit, width, height, raw, place) and dim_panel(raw, dimmed):
+                panel = dimmed
+            side_panels[side["name"]] = panel
+
+    fitted_sides = {}
+    for _window, mon, left, right in targets:
+        if not mon:
+            continue
+        _width, height, _fit = canvas_for(mon)
+        for side in (left, right):
+            if not side:
+                continue
+            key = (side["name"], height)
+            if key in fitted_sides:
+                continue
+            panel = side_panels.get(side["name"])
+            dest = work / f"fit-{side['name']}-{height}.jpg"
+            fitted_sides[key] = dest if panel and match_height(panel, height, dest) else None
+
     used = set()
     jobs = []
-    for window in windows:
+    for window, mon, left, right in targets:
         label = preview_label(window, used)
         dest = PREVIEW_DIR / f"{label}.jpg"
-        jobs.append((window, dest, label))
+        jobs.append((window, mon, left, right, dest, label))
 
     def shoot(job):
-        window, dest, label = job
-        if capture_window(window, dest):
+        window, mon, left, right, dest, label = job
+        shot = shots.get(window.get("address"))
+        if mon and shot:
+            width, height, fit = canvas_for(mon)
+            peers = by_ws.get((window.get("workspace") or {}).get("id"), [window])
+            place = workspace_place(peers, mon)
+            box = rect_for(window, mon, fit, place)
+            safe = re.sub(r"[^A-Za-z0-9]+", "", str(window.get("stableId") or "w"))
+            flat = work / f"flat-{safe}.jpg"
+            marked = work / f"mark-{safe}.jpg"
+            if (
+                box
+                and composite_windows(peers, shots, mon, fit, width, height, flat, place)
+                and highlight_window(flat, shot, box, width, height, marked)
+            ):
+                left_path = fitted_sides.get((left["name"], height)) if left else None
+                right_path = fitted_sides.get((right["name"], height)) if right else None
+                if append_panels(left_path, marked, right_path, dest):
+                    return window, dest
+        if shot:
+            shutil.copy(shot, dest)
             return window, dest
         if placeholder_preview(dest, label):
             return window, dest
         return window, None
 
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    with ThreadPoolExecutor(max_workers=3) as pool:
         shot = list(pool.map(shoot, jobs))
+    shutil.rmtree(work, ignore_errors=True)
     return [(window, dest) for window, dest in shot if dest is not None]
 
 

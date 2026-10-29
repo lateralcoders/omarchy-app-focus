@@ -57,6 +57,8 @@ omarchy-shell shell toggle io.github.lateralcoders.app-focus
 
 Enter on an empty filter repeats the last app. The list puts that app first. Each row shows the app's desktop icon. Tmux uses the terminal icon, because those windows are the terminal. A missing icon falls back to the app's initial.
 
+A window screenshot is that window on its screen. Other apps there are blurred, and a light box marks the one you would focus. The screen to the left or right is drawn beside it, dimmed. In the thumbnail row, the selected window is the one with the border.
+
 ## Launch commands
 
 Stock launches:
