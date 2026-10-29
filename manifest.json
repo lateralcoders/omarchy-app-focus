@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.lateralcoders.app-focus",
   "name": "App Focus",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "author": "Zute Predictive",
   "license": "MIT",
   "description": "Type an app name to focus its window, including one on another workspace or a hidden scratchpad, or launch it if it is closed. Several windows open a second step that shows each one on its own monitor, with the other apps there blurred.",

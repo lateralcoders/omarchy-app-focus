@@ -523,7 +523,7 @@ def focus_window(group, window):
 
 
 def preview_label(window, used):
-    """Display text for the switcher. Never a file name."""
+    """Display text for the overlay. Never pass this to another program."""
     workspace = workspace_name(window)
     if workspace.startswith("special:"):
         place = workspace.split(":", 1)[1] or "scratchpad"
@@ -961,7 +961,8 @@ def pick_preview(windows, pairs=None):
     """Show captured windows. Return the chosen window, or None if cancelled."""
     captured = list(pairs) if pairs is not None else write_previews(windows)
     if not captured:
-        return pick_window_text(windows)
+        # A text menu would put each window title on omarchy-menu-select's command line.
+        return None
 
     by_path = {str(dest): window for window, dest in captured}
     recent = min(windows, key=lambda window: window.get("focusHistoryID", 10**9))
@@ -995,7 +996,7 @@ def pick_preview(windows, pairs=None):
             text=True,
         )
         if opened.returncode != 0 or opened.stdout.strip() != "ok":
-            return pick_window_text(windows)
+            return None
         deadline = time.monotonic() + 120
         while not done_path.exists():
             if time.monotonic() > deadline:
@@ -1019,27 +1020,6 @@ def pick_preview(windows, pairs=None):
     finally:
         selection_path.unlink(missing_ok=True)
         done_path.unlink(missing_ok=True)
-
-
-def pick_window_text(windows):
-    options = []
-    by_label = {}
-    used = set()
-    for window in windows:
-        label = preview_label(window, used)
-        by_label[label] = window
-        workspace = workspace_name(window)
-        place = workspace.split(":", 1)[1] if workspace.startswith("special:") else f"workspace {workspace}"
-        options.append(f"\t{label}\t{place}")
-    result = subprocess.run(
-        ["omarchy-menu-select", "Choose window", *options, "--", "--width", "640", "--maxheight", "520"],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        return None
-    label = result.stdout.split("\t", 1)[0].strip()
-    return by_label.get(label)
 
 
 def activate(group):
@@ -1242,9 +1222,8 @@ def main():
         if len(windows) > 1:
             worker.join(90)
             if worker.is_alive():
-                window = pick_window_text(windows)
-            else:
-                window = pick_preview(windows, ready.get(group["id"]))
+                return
+            window = pick_preview(windows, ready.get(group["id"]))
             if window is None:
                 return
             focus_window(group, window)
