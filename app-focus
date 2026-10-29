@@ -23,7 +23,9 @@ from pathlib import Path
 
 RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
 STATE_PATH = RUNTIME / "hypr-focus.json"
-PREVIEW_DIR = RUNTIME / "hypr-focus" / "previews"
+# Home cache, not /tmp. File names stay window ids so grim and magick
+# arguments never include a window title.
+PREVIEW_DIR = Path.home() / ".cache" / "omarchy" / "app-focus-previews"
 CONFIG_PATH = Path.home() / ".config" / "omarchy-switcher" / "launches.json"
 LAUNCH_GRACE_SECONDS = 3
 
@@ -521,6 +523,7 @@ def focus_window(group, window):
 
 
 def preview_label(window, used):
+    """Display text for the switcher. Never a file name."""
     workspace = workspace_name(window)
     if workspace.startswith("special:"):
         place = workspace.split(":", 1)[1] or "scratchpad"
@@ -544,6 +547,23 @@ def preview_label(window, used):
     return name
 
 
+def preview_stem(window, used):
+    """Opaque file name. A window title must not appear in a tool argument."""
+    raw = str(window.get("stableId") or "")
+    stem = re.sub(r"[^A-Za-z0-9]+", "", raw)
+    if not stem:
+        raw = str(window.get("address") or "window")
+        stem = re.sub(r"[^A-Za-z0-9]+", "", raw) or "window"
+    stem = stem[:64]
+    name = stem
+    suffix = 2
+    while name.casefold() in used:
+        name = f"{stem}{suffix}"
+        suffix += 1
+    used.add(name.casefold())
+    return name
+
+
 def capture_window(window, dest):
     stable_id = str(window.get("stableId") or "")
     if not stable_id:
@@ -555,19 +575,13 @@ def capture_window(window, dest):
     return result.returncode == 0 and dest.is_file() and dest.stat().st_size > 0
 
 
-def placeholder_preview(dest, label):
+def placeholder_preview(dest):
     result = subprocess.run(
         [
             "magick",
-            "-background",
-            "#1c1c1c",
-            "-fill",
-            "#f2f2f2",
-            "-gravity",
-            "center",
             "-size",
             "960x540",
-            f"caption:{label.replace('@', '')}",
+            "xc:#1c1c1c",
             str(dest),
         ],
         capture_output=True,
@@ -800,7 +814,8 @@ def capture_shots(windows, raw_dir):
         if not address or not stable_id or address in seen:
             continue
         seen.add(address)
-        jobs.append((window, raw_dir / f"{stable_id}.jpg"))
+        safe_id = re.sub(r"[^A-Za-z0-9]+", "", stable_id) or "window"
+        jobs.append((window, raw_dir / f"{safe_id}.jpg"))
 
     def shoot(job):
         window, dest = job
@@ -818,14 +833,30 @@ def capture_shots(windows, raw_dir):
     return shots
 
 
+def reset_preview_dir():
+    """Replace the preview directory. It is mode 0700 under the home cache."""
+    PREVIEW_DIR.parent.mkdir(parents=True, exist_ok=True)
+    if PREVIEW_DIR.is_symlink():
+        PREVIEW_DIR.unlink()
+    elif PREVIEW_DIR.exists():
+        if PREVIEW_DIR.is_dir():
+            shutil.rmtree(PREVIEW_DIR)
+        else:
+            PREVIEW_DIR.unlink()
+    PREVIEW_DIR.mkdir(mode=0o700)
+    os.chmod(PREVIEW_DIR, 0o700)
+    legacy = RUNTIME / "hypr-focus" / "previews"
+    if legacy != PREVIEW_DIR and legacy.is_dir() and not legacy.is_symlink():
+        shutil.rmtree(legacy, ignore_errors=True)
+
+
 def write_previews(windows):
     """Build one image per window, confined to that window's monitor.
 
     The preview directory is replaced at the start, so only one capture may run.
+    Published file names are window ids. Titles stay in the overlay label.
     """
-    if PREVIEW_DIR.exists():
-        shutil.rmtree(PREVIEW_DIR)
-    PREVIEW_DIR.mkdir(parents=True)
+    reset_preview_dir()
     work = PREVIEW_DIR / "work"
     work.mkdir()
     monitors, spaces = layout()
@@ -866,28 +897,34 @@ def write_previews(windows):
         if composite_windows(peers, shots, mon, fit, width, height, flat, place) and blur_monitor(flat, blurred):
             plates[ws_id] = (blurred, width, height, fit, place)
 
-    used = set()
+    used_names = set()
     jobs = []
     for window, mon, ws_id in targets:
-        label = preview_label(window, used)
-        dest = PREVIEW_DIR / f"{label}.jpg"
-        jobs.append((window, mon, ws_id, dest, label))
+        dest = PREVIEW_DIR / f"{preview_stem(window, used_names)}.jpg"
+        jobs.append((window, mon, ws_id, dest))
 
     def shoot(job):
-        window, mon, ws_id, dest, label = job
+        window, mon, ws_id, dest = job
         shot = shots.get(window.get("address"))
         plate = plates.get(ws_id)
+        wrote = False
         if mon and shot and plate:
             blurred, width, height, fit, place = plate
             box = rect_for(window, mon, fit, place)
             if box and highlight_window(blurred, shot, box, width, height, dest):
-                return window, dest
-        if shot:
+                wrote = True
+        if not wrote and shot:
             shutil.copy(shot, dest)
-            return window, dest
-        if placeholder_preview(dest, label):
-            return window, dest
-        return window, None
+            wrote = True
+        if not wrote and placeholder_preview(dest):
+            wrote = True
+        if not wrote or not dest.is_file():
+            return window, None
+        try:
+            os.chmod(dest, 0o600)
+        except OSError:
+            pass
+        return window, dest
 
     with ThreadPoolExecutor(max_workers=4) as pool:
         shot = list(pool.map(shoot, jobs))
@@ -1079,12 +1116,13 @@ def focus_address(group, address):
 
 
 def preview_rows(pairs, windows):
+    used = set()
     rows = []
     for window, dest in pairs:
         rows.append(
             {
                 "address": window.get("address") or "",
-                "label": dest.stem,
+                "label": preview_label(window, used),
                 "image": str(dest),
             }
         )

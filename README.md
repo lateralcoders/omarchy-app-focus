@@ -74,7 +74,7 @@ Already present on a normal Omarchy install. The plugin does not install package
 - ImageMagick (`magick`), for the monitor composite and a placeholder if a capture fails
 - Python 3, standard library only (`python3 -I`)
 
-Screenshots are written under `$XDG_RUNTIME_DIR/hypr-focus/previews/` and removed on the next capture. The last-used app is stored in `$XDG_RUNTIME_DIR/hypr-focus.json`.
+Screenshots are written to `~/.cache/omarchy/app-focus-previews/` (mode 0700) and removed on the next capture. The file names are window ids, so the capture tools never receive a window title. Titles are only shown in the switcher. The last-used app is stored in `$XDG_RUNTIME_DIR/hypr-focus.json`.
 
 ## Launch commands
 
