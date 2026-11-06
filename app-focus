@@ -1176,13 +1176,9 @@ def publish_prewarm(groups):
 
     A client that never submits a frame only delays the app that shares its
     workspace. Other apps are printed while that capture is still running.
-    A one-window app is probed too. If it never answers, that app is printed
-    with the reason and no image. A shot that succeeds is not printed, so
-    Enter still focuses it.
     """
     multi = [group for group in groups if len(group.get("windows") or []) > 1]
-    singles = [group for group in groups if len(group.get("windows") or []) == 1]
-    if not multi and not singles:
+    if not multi:
         return
     stop_stale_captures()
     reset_preview_dir()
@@ -1204,23 +1200,12 @@ def publish_prewarm(groups):
             address = window.get("address")
             if address:
                 all_windows[address] = window
-    for group in singles:
-        window = group["windows"][0]
-        address = window.get("address")
-        if address and address not in all_windows:
-            all_windows[address] = window
 
     shots = {}
     errors = {}
     finished = set()
     published = set()
     used_names = set()
-    owners = {}
-    for group in groups:
-        for window in group.get("windows") or []:
-            address = window.get("address")
-            if address:
-                owners[address] = (group, window)
 
     def publish_line(group, pairs):
         published.add(group["id"])
@@ -1237,15 +1222,6 @@ def publish_prewarm(groups):
             pairs = render_previews(plan["targets"], shots, by_ws, work, used_names, errors)
             publish_line(group, pairs)
 
-    def publish_unanswered(address):
-        owner = owners.get(address)
-        if not owner:
-            return
-        group, window = owner
-        if group["id"] in published or len(group.get("windows") or []) != 1:
-            return
-        publish_line(group, [(window, None, CAPTURE_UNANSWERED)])
-
     jobs = capture_jobs(list(all_windows.values()), work)
     started = {window.get("address") for window, _dest in jobs}
     finished.update(address for address in all_windows if address not in started)
@@ -1259,7 +1235,6 @@ def publish_prewarm(groups):
                     shots[address] = dest
                 elif status == "timeout":
                     errors[address] = CAPTURE_UNANSWERED
-                    publish_unanswered(address)
                 finished.add(address)
                 publish_ready()
     shutil.rmtree(work, ignore_errors=True)

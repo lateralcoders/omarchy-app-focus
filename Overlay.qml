@@ -262,20 +262,11 @@ Item {
     var row = appModel.get(root.selectedIndex)
     if (!row) return
     var appId = String(row.appId)
-    if (Number(row.windowCount) > 1 || root.appHasCaptureError(appId)) {
+    if (Number(row.windowCount) > 1) {
       root.openWindows(appId, String(row.label), String(row.icon || ""))
       return
     }
     root.runActivate(appId)
-  }
-
-  function appHasCaptureError(appId) {
-    var cached = root.previewCache ? root.previewCache[appId] : null
-    if (!cached || !cached.length) return false
-    for (var i = 0; i < cached.length; i++) {
-      if (cached[i] && cached[i].error) return true
-    }
-    return false
   }
 
   function openWindows(appId, label, icon) {
