@@ -32,6 +32,10 @@ STATE_PATH = CACHE_DIR / "state.json"
 CONFIG_PATH = Path.home() / ".config" / "omarchy-switcher" / "launches.json"
 LAUNCH_GRACE_SECONDS = 3
 CAPTURE_TIMEOUT_SECONDS = 1
+CAPTURE_UNANSWERED = (
+    "This window did not respond to the capture request. "
+    "It was stopped after one second."
+)
 
 
 def legacy_state_paths():
@@ -757,8 +761,11 @@ def capture_window(window, dest):
             proc.kill()
         proc.wait()
         remove_tree_owned(dest)
-        return False
-    return proc.returncode == 0 and dest.is_file() and dest.stat().st_size > 0
+        return "timeout"
+    if proc.returncode == 0 and dest.is_file() and dest.stat().st_size > 0:
+        return "ok"
+    remove_tree_owned(dest)
+    return "failed"
 
 
 def placeholder_preview(dest):
@@ -993,10 +1000,11 @@ def highlight_window(base, target_path, box, width, height, dest):
 
 def shoot_capture(job):
     window, dest = job
-    if capture_window(window, dest) and seal_file(dest):
-        return window.get("address"), dest
+    status = capture_window(window, dest)
+    if status == "ok" and seal_file(dest):
+        return window.get("address"), dest, "ok"
     remove_tree_owned(dest)
-    return window.get("address"), None
+    return window.get("address"), None, status
 
 
 def capture_jobs(windows, raw_dir):
@@ -1015,14 +1023,17 @@ def capture_jobs(windows, raw_dir):
 
 def capture_shots(windows, raw_dir):
     shots = {}
+    errors = {}
     jobs = capture_jobs(windows, raw_dir)
     if not jobs:
-        return shots
+        return shots, errors
     with ThreadPoolExecutor(max_workers=4) as pool:
-        for address, dest in pool.map(shoot_capture, jobs):
+        for address, dest, status in pool.map(shoot_capture, jobs):
             if dest is not None:
                 shots[address] = dest
-    return shots
+            elif status == "timeout":
+                errors[address] = CAPTURE_UNANSWERED
+    return shots, errors
 
 
 def reset_preview_dir():
@@ -1064,7 +1075,7 @@ def prepare_targets(windows, monitors, spaces, by_ws):
     return needed, targets
 
 
-def render_previews(targets, shots, by_ws, work, used_names):
+def render_previews(targets, shots, by_ws, work, used_names, errors=None):
     """Turn finished shots into one published image per target window."""
     plates = {}
     for window, mon, ws_id in targets:
@@ -1089,9 +1100,15 @@ def render_previews(targets, shots, by_ws, work, used_names):
             remove_tree_owned(blurred)
 
     rendered = []
+    errors = errors or {}
     for window, mon, ws_id in targets:
+        address = window.get("address")
+        error = errors.get(address) or ""
+        shot = shots.get(address)
+        if error and not shot:
+            rendered.append((window, None, error))
+            continue
         dest = PREVIEW_DIR / f"{preview_stem(window, used_names)}.jpg"
-        shot = shots.get(window.get("address"))
         plate = plates.get(ws_id)
         wrote = False
         if mon and shot and plate:
@@ -1107,7 +1124,7 @@ def render_previews(targets, shots, by_ws, work, used_names):
         if not wrote or not seal_file(dest):
             remove_tree_owned(dest)
             continue
-        rendered.append((window, dest))
+        rendered.append((window, dest, ""))
     return rendered
 
 
@@ -1123,8 +1140,8 @@ def write_previews(windows):
     private_mkdir(work)
     monitors, spaces, by_ws = preview_scene()
     needed, targets = prepare_targets(windows, monitors, spaces, by_ws)
-    shots = capture_shots(needed, work)
-    rendered = render_previews(targets, shots, by_ws, work, set())
+    shots, errors = capture_shots(needed, work)
+    rendered = render_previews(targets, shots, by_ws, work, set(), errors)
     shutil.rmtree(work, ignore_errors=True)
     return rendered
 
@@ -1142,7 +1159,7 @@ def capture_multi(groups):
             if address and address not in seen:
                 seen.add(address)
                 windows.append(window)
-    by_address = {window.get("address"): pair for pair in write_previews(windows) for window, _dest in [pair]}
+    by_address = {pair[0].get("address"): pair for pair in write_previews(windows)}
     ready = {}
     for group in multi:
         pairs = []
@@ -1159,9 +1176,13 @@ def publish_prewarm(groups):
 
     A client that never submits a frame only delays the app that shares its
     workspace. Other apps are printed while that capture is still running.
+    A one-window app is probed too. If it never answers, that app is printed
+    with the reason and no image. A shot that succeeds is not printed, so
+    Enter still focuses it.
     """
     multi = [group for group in groups if len(group.get("windows") or []) > 1]
-    if not multi:
+    singles = [group for group in groups if len(group.get("windows") or []) == 1]
+    if not multi and not singles:
         return
     stop_stale_captures()
     reset_preview_dir()
@@ -1183,24 +1204,47 @@ def publish_prewarm(groups):
             address = window.get("address")
             if address:
                 all_windows[address] = window
+    for group in singles:
+        window = group["windows"][0]
+        address = window.get("address")
+        if address and address not in all_windows:
+            all_windows[address] = window
 
     shots = {}
+    errors = {}
     finished = set()
     published = set()
     used_names = set()
+    owners = {}
+    for group in groups:
+        for window in group.get("windows") or []:
+            address = window.get("address")
+            if address:
+                owners[address] = (group, window)
+
+    def publish_line(group, pairs):
+        published.add(group["id"])
+        print(
+            json.dumps({"id": group["id"], "rows": preview_rows(pairs, group["windows"])}),
+            flush=True,
+        )
 
     def publish_ready():
         for plan in plans:
             group = plan["group"]
-            group_id = group["id"]
-            if group_id in published or not plan["needed"] <= finished:
+            if group["id"] in published or not plan["needed"] <= finished:
                 continue
-            pairs = render_previews(plan["targets"], shots, by_ws, work, used_names)
-            published.add(group_id)
-            print(
-                json.dumps({"id": group_id, "rows": preview_rows(pairs, group["windows"])}),
-                flush=True,
-            )
+            pairs = render_previews(plan["targets"], shots, by_ws, work, used_names, errors)
+            publish_line(group, pairs)
+
+    def publish_unanswered(address):
+        owner = owners.get(address)
+        if not owner:
+            return
+        group, window = owner
+        if group["id"] in published or len(group.get("windows") or []) != 1:
+            return
+        publish_line(group, [(window, None, CAPTURE_UNANSWERED)])
 
     jobs = capture_jobs(list(all_windows.values()), work)
     started = {window.get("address") for window, _dest in jobs}
@@ -1210,9 +1254,12 @@ def publish_prewarm(groups):
         with ThreadPoolExecutor(max_workers=4) as pool:
             futures = [pool.submit(shoot_capture, job) for job in jobs]
             for future in as_completed(futures):
-                address, dest = future.result()
+                address, dest, status = future.result()
                 if dest is not None:
                     shots[address] = dest
+                elif status == "timeout":
+                    errors[address] = CAPTURE_UNANSWERED
+                    publish_unanswered(address)
                 finished.add(address)
                 publish_ready()
     shutil.rmtree(work, ignore_errors=True)
@@ -1225,6 +1272,9 @@ def pick_preview(windows, pairs=None):
         # A text menu would put each window title on omarchy-menu-select's command line.
         return None
 
+    captured = [(pair[0], pair[1]) for pair in captured if pair[1]]
+    if not captured:
+        return None
     by_path = {str(dest): window for window, dest in captured}
     recent = min(windows, key=lambda window: window.get("focusHistoryID", 10**9))
     selected = next((str(dest) for window, dest in captured if window is recent), "")
@@ -1365,14 +1415,17 @@ def focus_address(group, address):
 def preview_rows(pairs, windows):
     used = set()
     rows = []
-    for window, dest in pairs:
-        rows.append(
-            {
-                "address": window.get("address") or "",
-                "label": preview_label(window, used),
-                "image": str(dest),
-            }
-        )
+    for pair in pairs:
+        window, dest = pair[0], pair[1]
+        error = pair[2] if len(pair) > 2 else ""
+        row = {
+            "address": window.get("address") or "",
+            "label": preview_label(window, used),
+            "image": str(dest) if dest else "",
+        }
+        if error:
+            row["error"] = error
+        rows.append(row)
     if not rows:
         return rows
     recent = min(windows, key=lambda window: window.get("focusHistoryID", 10**9))

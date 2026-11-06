@@ -261,11 +261,21 @@ Item {
     if (root.mode !== "apps" || appModel.count === 0) return
     var row = appModel.get(root.selectedIndex)
     if (!row) return
-    if (Number(row.windowCount) > 1) {
-      root.openWindows(String(row.appId), String(row.label), String(row.icon || ""))
+    var appId = String(row.appId)
+    if (Number(row.windowCount) > 1 || root.appHasCaptureError(appId)) {
+      root.openWindows(appId, String(row.label), String(row.icon || ""))
       return
     }
-    root.runActivate(String(row.appId))
+    root.runActivate(appId)
+  }
+
+  function appHasCaptureError(appId) {
+    var cached = root.previewCache ? root.previewCache[appId] : null
+    if (!cached || !cached.length) return false
+    for (var i = 0; i < cached.length; i++) {
+      if (cached[i] && cached[i].error) return true
+    }
+    return false
   }
 
   function openWindows(appId, label, icon) {
@@ -336,7 +346,8 @@ Item {
       windowModel.append({
         address: String(parsed[i].address || ""),
         label: String(parsed[i].label || "window"),
-        image: String(parsed[i].image || "")
+        image: String(parsed[i].image || ""),
+        error: String(parsed[i].error || "")
       })
     }
     root.imageRev += 1
@@ -372,6 +383,13 @@ Item {
     if (root.selectedIndex < 0 || root.selectedIndex >= windowModel.count) return ""
     var row = windowModel.get(root.selectedIndex)
     return row ? String(row.label || "") : ""
+  }
+
+  function currentWindowError() {
+    if (windowModel.count === 0) return ""
+    if (root.selectedIndex < 0 || root.selectedIndex >= windowModel.count) return ""
+    var row = windowModel.get(root.selectedIndex)
+    return row ? String(row.error || "") : ""
   }
 
   function currentWindowImage() {
@@ -746,11 +764,41 @@ Item {
               id: stage
               anchors.fill: parent
               anchors.margins: Style.space(8)
+              visible: root.currentWindowError() === ""
               source: root.currentWindowImage()
               fillMode: Image.PreserveAspectFit
               smooth: true
               asynchronous: true
               cache: false
+            }
+
+            Column {
+              anchors.centerIn: parent
+              width: parent.width - Style.space(32)
+              visible: root.currentWindowError() !== ""
+              spacing: Style.space(8)
+
+              Text {
+                width: parent.width
+                textFormat: Text.PlainText
+                text: "No screenshot"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                horizontalAlignment: Text.AlignHCenter
+              }
+
+              Text {
+                width: parent.width
+                textFormat: Text.PlainText
+                text: root.currentWindowError()
+                color: root.foreground
+                opacity: 0.72
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                horizontalAlignment: Text.AlignHCenter
+                wrapMode: Text.WordWrap
+              }
             }
 
             MouseArea {
@@ -785,6 +833,7 @@ Item {
               required property string address
               required property string label
               required property string image
+              required property string error
               width: Style.space(112)
               height: Style.space(72)
               radius: Style.space(4)
@@ -795,11 +844,26 @@ Item {
               Image {
                 anchors.fill: parent
                 anchors.margins: index === root.selectedIndex ? Style.space(4) : Style.space(2)
+                visible: error === ""
                 source: root.imageUrl(image)
                 fillMode: Image.PreserveAspectFit
                 smooth: true
                 asynchronous: true
                 cache: false
+              }
+
+              Text {
+                anchors.centerIn: parent
+                width: parent.width - Style.space(8)
+                visible: error !== ""
+                textFormat: Text.PlainText
+                text: "Did not respond"
+                color: root.foreground
+                opacity: 0.78
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                horizontalAlignment: Text.AlignHCenter
+                wrapMode: Text.WordWrap
               }
 
               MouseArea {
