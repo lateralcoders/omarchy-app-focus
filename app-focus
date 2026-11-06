@@ -20,7 +20,7 @@ import sys
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # grim and magick inherit this, so files they create are user-only from the start.
@@ -31,7 +31,7 @@ PREVIEW_DIR = CACHE_DIR / "previews"
 STATE_PATH = CACHE_DIR / "state.json"
 CONFIG_PATH = Path.home() / ".config" / "omarchy-switcher" / "launches.json"
 LAUNCH_GRACE_SECONDS = 3
-CAPTURE_TIMEOUT_SECONDS = 4
+CAPTURE_TIMEOUT_SECONDS = 1
 
 
 def legacy_state_paths():
@@ -991,7 +991,15 @@ def highlight_window(base, target_path, box, width, height, dest):
     )
 
 
-def capture_shots(windows, raw_dir):
+def shoot_capture(job):
+    window, dest = job
+    if capture_window(window, dest) and seal_file(dest):
+        return window.get("address"), dest
+    remove_tree_owned(dest)
+    return window.get("address"), None
+
+
+def capture_jobs(windows, raw_dir):
     jobs = []
     seen = set()
     for window in windows:
@@ -1002,19 +1010,16 @@ def capture_shots(windows, raw_dir):
         seen.add(address)
         safe_id = re.sub(r"[^A-Za-z0-9]+", "", stable_id) or "window"
         jobs.append((window, raw_dir / f"{safe_id}.jpg"))
+    return jobs
 
-    def shoot(job):
-        window, dest = job
-        if capture_window(window, dest) and seal_file(dest):
-            return window.get("address"), dest
-        remove_tree_owned(dest)
-        return window.get("address"), None
 
+def capture_shots(windows, raw_dir):
     shots = {}
+    jobs = capture_jobs(windows, raw_dir)
     if not jobs:
         return shots
     with ThreadPoolExecutor(max_workers=4) as pool:
-        for address, dest in pool.map(shoot, jobs):
+        for address, dest in pool.map(shoot_capture, jobs):
             if dest is not None:
                 shots[address] = dest
     return shots
@@ -1029,24 +1034,19 @@ def reset_preview_dir():
         remove_tree_owned(path)
 
 
-def write_previews(windows):
-    """Build one image per window, confined to that window's monitor.
-
-    The preview directory is replaced at the start, so only one capture may run.
-    Published file names are window ids. Titles stay in the overlay label.
-    """
-    stop_stale_captures()
-    reset_preview_dir()
-    work = PREVIEW_DIR / "work"
-    private_mkdir(work)
+def preview_scene():
     monitors, spaces = layout()
     clients = [client for client in hyprctl_json("clients") if client.get("address") and client.get("class")]
     by_ws = {}
     for client in clients:
         by_ws.setdefault((client.get("workspace") or {}).get("id"), []).append(client)
+    return monitors, spaces, by_ws
 
+
+def prepare_targets(windows, monitors, spaces, by_ws):
     needed = []
     seen = set()
+    targets = []
 
     def add(window):
         address = window.get("address")
@@ -1054,7 +1054,6 @@ def write_previews(windows):
             seen.add(address)
             needed.append(window)
 
-    targets = []
     for window in windows:
         mon = monitor_for_window(window, monitors, spaces)
         ws_id = (window.get("workspace") or {}).get("id")
@@ -1062,8 +1061,11 @@ def write_previews(windows):
             add(peer)
         add(window)
         targets.append((window, mon, ws_id))
+    return needed, targets
 
-    shots = capture_shots(needed, work)
+
+def render_previews(targets, shots, by_ws, work, used_names):
+    """Turn finished shots into one published image per target window."""
     plates = {}
     for window, mon, ws_id in targets:
         if not mon or ws_id in plates:
@@ -1086,14 +1088,9 @@ def write_previews(windows):
             remove_tree_owned(flat)
             remove_tree_owned(blurred)
 
-    used_names = set()
-    jobs = []
+    rendered = []
     for window, mon, ws_id in targets:
         dest = PREVIEW_DIR / f"{preview_stem(window, used_names)}.jpg"
-        jobs.append((window, mon, ws_id, dest))
-
-    def shoot(job):
-        window, mon, ws_id, dest = job
         shot = shots.get(window.get("address"))
         plate = plates.get(ws_id)
         wrote = False
@@ -1109,13 +1106,27 @@ def write_previews(windows):
             wrote = True
         if not wrote or not seal_file(dest):
             remove_tree_owned(dest)
-            return window, None
-        return window, dest
+            continue
+        rendered.append((window, dest))
+    return rendered
 
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        shot = list(pool.map(shoot, jobs))
+
+def write_previews(windows):
+    """Build one image per window, confined to that window's monitor.
+
+    The preview directory is replaced at the start, so only one capture may run.
+    Published file names are window ids. Titles stay in the overlay label.
+    """
+    stop_stale_captures()
+    reset_preview_dir()
+    work = PREVIEW_DIR / "work"
+    private_mkdir(work)
+    monitors, spaces, by_ws = preview_scene()
+    needed, targets = prepare_targets(windows, monitors, spaces, by_ws)
+    shots = capture_shots(needed, work)
+    rendered = render_previews(targets, shots, by_ws, work, set())
     shutil.rmtree(work, ignore_errors=True)
-    return [(window, dest) for window, dest in shot if dest is not None]
+    return rendered
 
 
 def capture_multi(groups):
@@ -1141,6 +1152,70 @@ def capture_multi(groups):
                 pairs.append(pair)
         ready[group["id"]] = pairs
     return ready
+
+
+def publish_prewarm(groups):
+    """Print one app as soon as its own shots exist.
+
+    A client that never submits a frame only delays the app that shares its
+    workspace. Other apps are printed while that capture is still running.
+    """
+    multi = [group for group in groups if len(group.get("windows") or []) > 1]
+    if not multi:
+        return
+    stop_stale_captures()
+    reset_preview_dir()
+    work = PREVIEW_DIR / "work"
+    private_mkdir(work)
+    monitors, spaces, by_ws = preview_scene()
+    plans = []
+    all_windows = {}
+    for group in multi:
+        needed, targets = prepare_targets(group["windows"], monitors, spaces, by_ws)
+        plans.append(
+            {
+                "group": group,
+                "needed": {window.get("address") for window in needed if window.get("address")},
+                "targets": targets,
+            }
+        )
+        for window in needed:
+            address = window.get("address")
+            if address:
+                all_windows[address] = window
+
+    shots = {}
+    finished = set()
+    published = set()
+    used_names = set()
+
+    def publish_ready():
+        for plan in plans:
+            group = plan["group"]
+            group_id = group["id"]
+            if group_id in published or not plan["needed"] <= finished:
+                continue
+            pairs = render_previews(plan["targets"], shots, by_ws, work, used_names)
+            published.add(group_id)
+            print(
+                json.dumps({"id": group_id, "rows": preview_rows(pairs, group["windows"])}),
+                flush=True,
+            )
+
+    jobs = capture_jobs(list(all_windows.values()), work)
+    started = {window.get("address") for window, _dest in jobs}
+    finished.update(address for address in all_windows if address not in started)
+    publish_ready()
+    if jobs:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(shoot_capture, job) for job in jobs]
+            for future in as_completed(futures):
+                address, dest = future.result()
+                if dest is not None:
+                    shots[address] = dest
+                finished.add(address)
+                publish_ready()
+    shutil.rmtree(work, ignore_errors=True)
 
 
 def pick_preview(windows, pairs=None):
@@ -1346,15 +1421,7 @@ def main():
         print(json.dumps(public_groups(ordered_groups(groups))), flush=True)
         return
     if args == ["--prewarm"]:
-        shown = ordered_groups(groups)
-        ready = capture_multi(shown)
-        by_id = {group["id"]: group for group in shown}
-        payload = {
-            group_id: preview_rows(pairs, by_id[group_id]["windows"])
-            for group_id, pairs in ready.items()
-            if group_id in by_id
-        }
-        print(json.dumps(payload), flush=True)
+        publish_prewarm(ordered_groups(groups))
         return
     if len(args) == 2 and args[0] == "--previews":
         group = resolve(args[1], groups)

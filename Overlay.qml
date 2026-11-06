@@ -192,21 +192,22 @@ Item {
     warmProc.running = true
   }
 
-  function applyWarm(raw) {
+  function ingestWarmLine(line) {
+    var text = String(line || "").trim()
+    if (!text) return
     var parsed
     try {
-      parsed = JSON.parse(raw)
+      parsed = JSON.parse(text)
     } catch (e) {
-      parsed = null
+      return
     }
-    if (!parsed || Array.isArray(parsed)) parsed = ({})
-    root.previewCache = parsed
-    var wanted = root.warmWantedId
-    if (!(wanted && root.mode === "windows" && root.activeId === wanted)) return
+    if (!parsed || !parsed.id) return
+    if (!root.previewCache) root.previewCache = ({})
+    var rows = parsed.rows || []
+    root.previewCache[String(parsed.id)] = rows
+    if (!(root.warmWantedId && root.mode === "windows" && root.activeId === String(parsed.id))) return
     root.warmWantedId = ""
-    var rows = parsed[wanted]
-    if (rows && rows.length > 0) root.applyPreviews(rows)
-    else root.startPreviews(wanted)
+    root.applyPreviews(rows)
   }
 
   function rebuildApps() {
@@ -437,9 +438,9 @@ Item {
 
   Process {
     id: warmProc
-    stdout: StdioCollector {
-      id: warmOut
-      waitForEnd: true
+    stdout: SplitParser {
+      splitMarker: "\n"
+      onRead: function(line) { root.ingestWarmLine(line) }
     }
     stderr: StdioCollector {
       id: warmErr
@@ -455,16 +456,14 @@ Item {
         return
       }
       if (!root.opened) return
-      if (exitCode !== 0) {
+      if (exitCode !== 0)
         console.warn("app-focus prewarm failed", exitCode, warmErr.text)
-        var wanted = root.warmWantedId
-        if (wanted && root.mode === "windows" && root.activeId === wanted) {
-          root.warmWantedId = ""
-          root.startPreviews(wanted)
-        }
-        return
-      }
-      root.applyWarm(warmOut.text)
+      var wanted = root.warmWantedId
+      if (!(wanted && root.mode === "windows" && root.activeId === wanted)) return
+      root.warmWantedId = ""
+      var rows = root.previewCache ? root.previewCache[wanted] : null
+      if (rows && rows.length > 0) root.applyPreviews(rows)
+      else root.startPreviews(wanted)
     }
   }
 
