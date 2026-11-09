@@ -39,18 +39,16 @@ CAPTURE_UNANSWERED = (
 
 
 def legacy_state_paths():
-    paths = [Path("/tmp") / "hypr-focus.json"]
+    """Old state lived in this user's runtime dir. Never look in /tmp."""
     runtime = os.environ.get("XDG_RUNTIME_DIR")
-    if runtime:
-        paths.append(Path(runtime) / "hypr-focus.json")
-    return paths
+    if not runtime:
+        return []
+    return [Path(runtime) / "hypr-focus.json"]
 
 
 def legacy_preview_dirs():
-    paths = [
-        Path.home() / ".cache" / "omarchy" / "app-focus-previews",
-        Path("/tmp") / "hypr-focus" / "previews",
-    ]
+    """Old preview directories this user owns. Never look in /tmp."""
+    paths = [Path.home() / ".cache" / "omarchy" / "app-focus-previews"]
     runtime = os.environ.get("XDG_RUNTIME_DIR")
     if runtime:
         paths.append(Path(runtime) / "hypr-focus" / "previews")
@@ -119,8 +117,9 @@ def seal_file(path):
 
 
 def read_owned(path):
+    """Read a regular file this user owns. A FIFO must not block the open."""
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
     except OSError:
         return None
     try:
