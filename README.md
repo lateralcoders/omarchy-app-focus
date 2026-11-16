@@ -74,7 +74,7 @@ Already present on a normal Omarchy install. The plugin does not install package
 - ImageMagick (`magick`), for the monitor composite and a placeholder if a capture fails
 - Python 3, standard library only (`python3 -I`)
 
-Screenshots and the last-used app are written under `~/.cache/omarchy/app-focus/`. That directory is mode 0700, and every file inside it is mode 0600. The helper sets its file-creation mask to 0077 before `grim` or `magick` run, so a new screenshot is user-only when it is created. Preview file names are window ids. Window titles are drawn in the switcher and are not passed as arguments to other programs.
+Screenshots and the last-used app are written under `~/.cache/omarchy/app-focus/`. That directory is mode 0700, and every file inside it is mode 0600. The helper sets its file-creation mask to 0077 before `grim` or `magick` run, so a new screenshot is user-only when it is created. ImageMagick temporary files stay in that same private directory instead of `/tmp`. Preview file names are window ids. Window titles are drawn in the switcher and are not passed as arguments to other programs.
 
 ## Launch commands
 

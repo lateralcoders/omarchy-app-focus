@@ -38,20 +38,47 @@ CAPTURE_UNANSWERED = (
 )
 
 
+def shared_location(path):
+    """True for /tmp, /var/tmp, /dev/shm, or a directory another account can write."""
+    try:
+        resolved = path.resolve(strict=False)
+    except OSError:
+        return True
+    for root in (Path("/tmp"), Path("/var/tmp"), Path("/dev/shm")):
+        if resolved == root or root in resolved.parents:
+            return True
+    parent = resolved.parent
+    try:
+        info = parent.lstat()
+    except OSError:
+        return True
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        return True
+    return bool(stat.S_IMODE(info.st_mode) & 0o022)
+
+
 def legacy_state_paths():
-    """Old state lived in this user's runtime dir. Never look in /tmp."""
+    """Old state lived in this user's private runtime dir."""
     runtime = os.environ.get("XDG_RUNTIME_DIR")
     if not runtime:
         return []
-    return [Path(runtime) / "hypr-focus.json"]
+    path = Path(runtime) / "hypr-focus.json"
+    if shared_location(path):
+        return []
+    return [path]
 
 
 def legacy_preview_dirs():
-    """Old preview directories this user owns. Never look in /tmp."""
-    paths = [Path.home() / ".cache" / "omarchy" / "app-focus-previews"]
+    """Old preview directories this user owns, outside shared temp directories."""
+    paths = []
+    old_cache = Path.home() / ".cache" / "omarchy" / "app-focus-previews"
+    if not shared_location(old_cache):
+        paths.append(old_cache)
     runtime = os.environ.get("XDG_RUNTIME_DIR")
     if runtime:
-        paths.append(Path(runtime) / "hypr-focus" / "previews")
+        path = Path(runtime) / "hypr-focus" / "previews"
+        if not shared_location(path):
+            paths.append(path)
     return paths
 
 
@@ -98,7 +125,7 @@ def remove_tree_owned(path):
 def seal_file(path):
     """Force a regular file this user owns to 0600. A symlink is removed and rejected."""
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
     except OSError:
         remove_tree_owned(path)
         return False
@@ -126,6 +153,8 @@ def read_owned(path):
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
             return None
+        if stat.S_IMODE(info.st_mode) & 0o022:
+            return None
         return os.read(fd, 1_000_000).decode()
     finally:
         os.close(fd)
@@ -133,7 +162,7 @@ def read_owned(path):
 
 def write_private(path, text):
     private_mkdir(path.parent)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
     fd = os.open(path, flags, 0o600)
     try:
         os.fchmod(fd, 0o600)
@@ -348,8 +377,8 @@ def sort_windows(windows):
 def launch_commands():
     commands = {key: list(value) for key, value in DEFAULT_LAUNCH.items()}
     try:
-        data = json.loads(CONFIG_PATH.read_text())
-    except (OSError, json.JSONDecodeError):
+        data = json.loads(read_owned(CONFIG_PATH) or "")
+    except (OSError, json.JSONDecodeError, TypeError):
         return commands
     if not isinstance(data, dict):
         return commands
@@ -750,6 +779,7 @@ def capture_window(window, dest):
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
+        env=tool_env(),
     )
     try:
         proc.wait(CAPTURE_TIMEOUT_SECONDS)
@@ -892,8 +922,22 @@ def workspace_place(windows, mon):
     return (scale, min_x, min_y, target_x, target_y)
 
 
+def tool_env():
+    """Keep grim and ImageMagick temporary files in the private cache.
+
+    ImageMagick is built with its temporary path set to /tmp. A large composite
+    spills screenshot pixels into /tmp/magick-* unless this directory is set.
+    """
+    temp = CACHE_DIR / "tmp"
+    private_mkdir(temp)
+    env = os.environ.copy()
+    env["TMPDIR"] = str(temp)
+    env["MAGICK_TMPDIR"] = str(temp)
+    return env
+
+
 def magick(args):
-    result = subprocess.run(["magick", *args], capture_output=True)
+    result = subprocess.run(["magick", *args], capture_output=True, env=tool_env())
     return result.returncode == 0
 
 
